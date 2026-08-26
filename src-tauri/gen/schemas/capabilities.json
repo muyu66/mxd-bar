@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"主条与悬浮面板窗口的基础权限(事件监听/窗口操作等)","local":true,"windows":["main","popup"],"permissions":["core:default"]}}

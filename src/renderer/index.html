@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>冒险岛怀旧服经验记录器</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <button id="btn-close" class="btn-close" title="关闭">✕</button>
+    <div id="app">
+      <!-- 状态1:输入 BAR -->
+      <section id="state-input" class="state">
+        <div class="bar">
+          <div class="field">
+            <label for="in-level">等级</label>
+            <input id="in-level" type="number" min="1" max="200" value="1" />
+          </div>
+
+          <div class="field">
+            <label for="in-job">职业</label>
+            <select id="in-job"></select>
+          </div>
+
+          <div class="field">
+            <label for="in-map">地图</label>
+            <input
+              id="in-map"
+              type="text"
+              placeholder="搜索地图"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+
+          <div class="field">
+            <label>模式</label>
+            <div class="seg" id="seg-party">
+              <button type="button" data-mode="party">组队</button>
+              <button type="button" data-mode="solo" class="active">
+                单人
+              </button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="in-gold">金币</label>
+            <div class="input-unit">
+              <input id="in-gold" type="number" min="0" step="any" value="0" />
+              <span class="unit">万</span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="l-hp">HP</label>
+            <div class="potion-row">
+              <button
+                id="in-hp-potion-btn"
+                class="potion-btn"
+                data-list="hp"
+                title="HP药水"
+              ></button>
+              <input
+                id="in-hp-count"
+                type="text"
+                inputmode="numeric"
+                value="0"
+                title="HP药水数量"
+              />
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="l-mp">MP</label>
+            <div class="potion-row">
+              <button
+                id="in-mp-potion-btn"
+                class="potion-btn"
+                data-list="mp"
+                title="MP药水"
+              ></button>
+              <input
+                id="in-mp-count"
+                type="text"
+                inputmode="numeric"
+                value="0"
+                title="MP药水数量"
+              />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="in-exp">EXP</label>
+            <div class="exp-row">
+              <div class="seg" id="seg-start">
+                <button type="button" data-mode="percent">%</button>
+                <button type="button" data-mode="value" class="active">
+                  数值
+                </button>
+              </div>
+              <input id="in-exp" type="text" inputmode="decimal" value="0" />
+            </div>
+          </div>
+
+          <button id="btn-start" class="btn btn-primary">开始记录</button>
+
+          <div class="divider"></div>
+
+          <div class="field">
+            <label>999打卡</label>
+            <button
+              id="checkin-999"
+              class="checkin-box waiting"
+              title="点击设置打卡时间"
+            >
+              待打卡
+            </button>
+          </div>
+
+          <div class="field">
+            <label>神秘商人</label>
+            <button
+              id="checkin-merchant"
+              class="checkin-box idle"
+              title="点击调整刷新时间"
+            >
+              --:--:--
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 状态2:计时器 -->
+      <section id="state-timer" class="state hidden">
+        <div class="bar timer-bar">
+          <div class="timer-clock" id="timer-clock">00:00:00</div>
+          <button id="btn-pause" class="btn btn-neutral">暂停</button>
+          <button id="btn-stop" class="btn btn-danger">完成</button>
+          <div class="divider"></div>
+          <button id="btn-cancel-timer" class="btn btn-ghost">取消</button>
+        </div>
+      </section>
+
+      <!-- 状态3:结束 BAR -->
+      <section id="state-end" class="state hidden">
+        <div class="bar">
+          <div class="field">
+            <label for="out-level">等级</label>
+            <input id="out-level" type="number" min="1" max="200" value="1" />
+          </div>
+
+          <div class="field">
+            <label for="out-gold">金币</label>
+            <div class="input-unit">
+              <input id="out-gold" type="number" min="0" step="any" value="0" />
+              <span class="unit">万</span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="l-hp">HP</label>
+            <div class="potion-row">
+              <button
+                id="out-hp-potion-btn"
+                class="potion-btn"
+                data-list="hp"
+                title="HP药水"
+              ></button>
+              <input
+                id="out-hp-count"
+                type="text"
+                inputmode="numeric"
+                value="0"
+                title="HP药水数量"
+              />
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="l-mp">MP</label>
+            <div class="potion-row">
+              <button
+                id="out-mp-potion-btn"
+                class="potion-btn"
+                data-list="mp"
+                title="MP药水"
+              ></button>
+              <input
+                id="out-mp-count"
+                type="text"
+                inputmode="numeric"
+                value="0"
+                title="MP药水数量"
+              />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="out-exp">EXP</label>
+            <div class="exp-row">
+              <div class="seg" id="seg-end">
+                <button type="button" data-mode="percent">%</button>
+                <button type="button" data-mode="value" class="active">
+                  数值
+                </button>
+              </div>
+              <input id="out-exp" type="text" inputmode="decimal" value="0" />
+            </div>
+          </div>
+
+          <div class="divider"></div>
+          <button id="btn-cancel-end" class="btn btn-ghost">取消</button>
+          <button id="btn-submit" class="btn btn-primary">提交数据</button>
+        </div>
+      </section>
+
+      <!-- 状态4:成功 -->
+      <section id="state-done" class="state hidden">
+        <div class="done-wrap">
+          <div class="done-icon">✓</div>
+          <div class="done-msg">
+            数据已上传，请前往
+            <a id="done-link" href="#">https://mxd.zhuzhu.website</a> 查看
+          </div>
+          <div class="done-btns">
+            <button id="btn-visit" class="btn btn-primary">立即前往</button>
+            <button id="btn-restart" class="btn btn-ghost">返回</button>
+          </div>
+        </div>
+      </section>
+    </div>
+    <script src="mxd-api.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

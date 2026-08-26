@@ -1,0 +1,16 @@
+{
+  "name": "mxd-exp-recorder",
+  "version": "1.0.0",
+  "description": "冒险岛怀旧服经验记录器",
+  "author": "muyuz",
+  "license": "MIT",
+  "scripts": {
+    "fetch-data": "node scripts/fetch-data.mjs",
+    "start": "cd src-tauri && cargo run",
+    "dist": "cd src-tauri && cargo build --release && node ../scripts/copy-exe.mjs",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}

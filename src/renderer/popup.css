@@ -1,0 +1,127 @@
+/* 悬浮面板小窗 — 深色圆角,与主条同风格 */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg2: #1f2333;
+  --panel: #10131f;
+  --line: #2e3450;
+  --text: #e8eaf2;
+  --muted: #8b93a7;
+  --accent: #f5a623;
+}
+
+html, body { background: transparent; }
+body {
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg2);
+  border-radius: 7px;
+  box-shadow: inset 0 0 0 1px var(--line); /* 内描边,不占布局空间(占空间会导致药水格横向溢出出滚动条) */
+  overflow: hidden;
+  user-select: none;
+  height: 100vh;
+}
+
+#popup-root { height: 100%; overflow-y: auto; }
+
+/* 地图行:只显示名字 */
+.popup-opt {
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-bottom: 1px solid rgba(46, 52, 80, .5);
+}
+.popup-opt:last-child { border-bottom: none; }
+.popup-opt-street { color: var(--muted); font-size: 10px; }
+.popup-opt:hover { background: #262b40; }
+.popup-opt.active { background: #262b40; color: var(--accent); }
+.popup-empty { padding: 12px 10px; text-align: center; color: var(--muted); }
+
+/* 药水图标格 */
+.popup-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 30px);
+  gap: 4px;
+  padding: 8px;
+}
+.popup-potion {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  cursor: pointer;
+  padding: 0;
+}
+.popup-potion:hover { border-color: var(--accent); }
+.popup-potion.active { border-color: var(--accent); background: rgba(245, 166, 35, .18); }
+.popup-potion img { width: 24px; height: 24px; object-fit: contain; display: block; }
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-thumb { background: #39405e; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #4a5278; }
+
+/* 时分输入器 */
+.popup-time { padding: 8px 10px; }
+.popup-time-title {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 6px;
+  white-space: nowrap;
+}
+.popup-time-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+.popup-time-input {
+  width: 34px;
+  height: 26px;
+  padding: 0 4px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: Consolas, "Courier New", monospace;
+  text-align: center;
+  outline: none;
+}
+.popup-time-input:focus { border-color: var(--accent); }
+.popup-time-colon { font-size: 14px; color: var(--muted); }
+.popup-time-row.err .popup-time-input { border-color: #e05a5a; }
+.popup-time-row.err { animation: shake .3s; }
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  75% { transform: translateX(3px); }
+}
+.popup-time-btns {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.popup-time-btns button {
+  flex: 1;
+  height: 22px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.popup-time-btns button:first-child {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1a1408;
+  font-weight: 600;
+}

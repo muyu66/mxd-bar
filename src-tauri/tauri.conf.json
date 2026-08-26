@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "猪猪冒险岛BAR",
+  "version": "1.0.0",
+  "identifier": "com.zhuzhu.mxdbar",
+  "build": {
+    "frontendDist": "../src/renderer"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"]
+  }
+}
