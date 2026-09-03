@@ -1,0 +1,49 @@
+[package]
+name = "mxd-bar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 只启用 glow 渲染 + 内置字体，去掉默认的 wgpu/accesskit 等，减小体积与内存。
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+
+# 数据表 JSON 解析
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 主板序列号 → UID
+md-5 = "0.10"
+
+# 日期/时分（999打卡/商人/BOSS）
+chrono = { version = "0.4", features = ["clock"] }
+
+# Windows 系统集成：游戏窗截图(PrintWindow/BitBlt)、Windows 自带 OCR(WinRT)、
+# 进程/hwnd 枚举、COM 初始化。feature 只开要用的，避免把整个 crate 编进来。
+# 注意：Media_Ocr 之外还必须开 Graphics_Imaging / Storage_Streams /
+# Foundation / Globalization，否则 RecognizeAsync / SoftwareBitmap 等体被 cfg 掉。
+windows = { version = "0.62", features = [
+  "Foundation",
+  "Globalization",
+  "Media_Ocr",
+  "Graphics_Imaging",
+  "Storage",
+  "Storage_Streams",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Storage_Xps",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_WinRT",
+  "Win32_System_Com",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+] }
+
+# windows 0.62 把泛型 WinRT 类型拆到独立小 crate：
+# RecognizeAsync 等返回的异步操作、OCR 结果集合都在这些 crate 里。
+windows-future = { version = "0.3.2", default-features = false }
+windows-collections = { version = "0.3.2", default-features = false }
+
+[profile.release]
+# 对小程序开 LTO 减小体积（按需可调）。
+lto = "thin"

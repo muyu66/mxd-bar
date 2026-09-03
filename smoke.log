@@ -1,0 +1,32 @@
+   Compiling mxd-bar v0.1.0 (C:\Web\mxd-bar)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.90s
+     Running `target\debug\mxd-bar.exe --page-pick`
+[mxd-bar] 启动: 职业组 5 个, 打怪地图 237 张
+[DEBUG] 06:12:02 游戏窗口最小化，抓不到画面 EXP=--
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+[mxd-bar][measure] used_h=145 open=true
+error: process didn't exit successfully: `target\debug\mxd-bar.exe --page-pick` (exit code: 143)
