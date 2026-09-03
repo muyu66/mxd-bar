@@ -63,7 +63,7 @@ body {
   align-items: center;
   justify-content: center; /* 字段整体居中 */
   gap: 10px;
-  padding: 6px 30px; /* 左右对称,右侧留给关闭按钮 */
+  padding: 6px 22px; /* 左右对称,右侧留给关闭按钮 */
   height: 100%;
   /* 拖动用 JS 实现(见 app.js),不用 app-region:
      后者会把关闭按钮区域也当成窗口拖动手柄,吞掉点击 */
@@ -173,6 +173,29 @@ input[type="number"] { -moz-appearance: textfield; }
   60% { transform: translateX(-1px); }
   80% { transform: translateX(1px); }
 }
+
+/* ---------- BOSS计时:死亡时刻 + 已过时长,两标签紧挨,中间分割线 + 颜色区分 ---------- */
+.boss-box { display: flex; flex-shrink: 0; }
+.boss-box button {
+  height: 24px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 6px;
+  color: var(--muted);
+}
+.boss-box button:first-child { border-radius: 5px 0 0 5px; width: 72px; }
+.boss-box button:last-child {
+  border-radius: 0 5px 5px 0;
+  border-left: 2px solid rgba(255, 255, 255, .4); /* 两标签间明显分割 */
+  width: 68px;
+}
+.boss-box button:hover { border-color: var(--accent); }
+.boss-box .boss-time { color: var(--accent); }   /* 死亡时刻:冒险岛橙 */
+.boss-box .boss-elapsed { color: var(--ok); }    /* 已过时长:成功绿 */
+.boss-box button.idle { color: var(--muted); }
 
 /* ---------- EXP 模式切换 + 输入 ---------- */
 .exp-row { display: flex; align-items: center; gap: 4px; }

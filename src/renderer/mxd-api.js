@@ -26,6 +26,7 @@
     dragStart: () => invoke('drag_start'),
     dragMove: (dx, dy) => invoke('drag_move', { dx, dy }),
     dragEnd: () => invoke('drag_end'),
+    setWindowWidth: (width) => invoke('set_window_width', { width }),
     // 悬浮面板(主条窗口用 show/render/close/onPick,面板小窗用 onRender/pick/ready)
     popup: {
       show: (opts) => invoke('popup_show', { opts }),

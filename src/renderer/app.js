@@ -20,9 +20,10 @@
   let timerInterval = null;
   let submitting = false;
 
-  // 999打卡 / 神秘商人(时间戳基准,关闭程序时间照走)
+  // 999打卡 / 神秘商人 / BOSS计时(时间戳基准,关闭程序时间照走)
   let checkin999Anchor = null;   // 上次999打卡时刻(ms)
   let merchantAnchor = null;     // 上次神秘商人刷新时刻(ms)
+  let bossAnchor = null;         // 上次BOSS死亡时刻(ms)
   let timePickerTarget = null;   // '999' | 'merchant'
   let merchantRefreshed = false;    // 已跨过刷新点 → 显示"已刷新"+振动,悬停确认后清除
   let merchantHovered = false;      // 鼠标悬停在商人框上
@@ -45,8 +46,20 @@
     bindEvents();
     refreshExpUI();
     refreshPartyUI();
-    updateCheckinTimers();
-    setInterval(updateCheckinTimers, 500); // 打卡/商人倒计时刷新
+    updateTimers();
+    setInterval(updateTimers, 500); // 打卡/商人/BOSS计时刷新
+    fitWindowWidth();
+  }
+
+  // ---------- 面板宽度贴合内容 ----------
+  // 量取输入条各控件实际宽度 + 间距,让窗口紧凑包裹(DPI 换算在 Rust 侧完成)
+  function fitWindowWidth() {
+    const bar = $('#state-input .bar');
+    if (!bar || !window.mxdApi.setWindowWidth) return;
+    const items = [...bar.children];
+    const content = items.reduce((s, el) => s + el.getBoundingClientRect().width, 0)
+      + Math.max(0, items.length - 1) * 10; // gap: 10px(见 style.css .bar)
+    window.mxdApi.setWindowWidth(content + 44); // 左右 padding 各 22px
   }
 
   // ---------- 设置恢复(上次关闭时的状态) ----------
@@ -77,6 +90,7 @@
     }
     if (typeof saved.checkin999 === 'number') checkin999Anchor = saved.checkin999;
     if (typeof saved.merchant === 'number') merchantAnchor = saved.merchant;
+    if (typeof saved.boss === 'number') bossAnchor = saved.boss;
   }
 
   // ---------- 设置持久化 ----------
@@ -96,6 +110,7 @@
       partyMode,
       checkin999: checkin999Anchor,
       merchant: merchantAnchor,
+      boss: bossAnchor,
     });
   }
 
@@ -291,8 +306,22 @@
     });
   }
 
-  // ---------- 999打卡 / 神秘商人 倒计时 ----------
-  function updateCheckinTimers() {
+  // ---------- 999打卡 / 神秘商人 / BOSS计时 倒计时 ----------
+  // 时间戳 → 本地时区当天时分秒(epoch 按 UTC 午夜对齐,% DAY_MS 截取会偏 8 小时)
+  function formatClockOf(ts) {
+    const d = new Date(ts);
+    return [d.getHours(), d.getMinutes(), d.getSeconds()]
+      .map((n) => String(n).padStart(2, '0')).join(':');
+  }
+
+  // BOSS已过时长:60 秒内显示秒,100 分钟内显示分钟,再长封顶 99+ 分钟
+  function formatElapsed(ms) {
+    if (ms < 60 * 1000) return `${Math.floor(ms / 1000)} 秒钟`;
+    if (ms < 100 * 60 * 1000) return `${Math.floor(ms / 60000)} 分钟`;
+    return '99+ 分钟';
+  }
+
+  function updateTimers() {
     const el999 = $('#checkin-999');
     const elM = $('#checkin-merchant');
     if (!el999 || !elM) return; // 非输入态不显示
@@ -327,26 +356,43 @@
         elM.textContent = formatHMS(Math.ceil(remaining));
       }
     }
+    // BOSS计时:左标签 = 死亡时刻(当天时分秒),右标签 = 距死亡已过时长
+    const elBD = $('#boss-death');
+    const elBE = $('#boss-elapsed');
+    if (!bossAnchor) {
+      elBD.classList.add('idle');
+      elBD.textContent = '--:--:--';
+      elBE.classList.add('idle');
+      elBE.textContent = '--';
+    } else {
+      elBD.classList.remove('idle');
+      elBD.textContent = formatClockOf(bossAnchor);
+      elBE.classList.remove('idle');
+      elBE.textContent = formatElapsed(Math.max(0, Date.now() - bossAnchor)); // 时钟回拨时兜底为 0
+    }
   }
 
-  // 点击倒计时框 → 弹出时分选择器(默认当前时分)
+  // 点击倒计时框 → 弹出时分(秒)选择器(999/商人默认规则见下,BOSS默认当前时间)
   function openTimePicker(target) {
     timePickerTarget = target;
     popupOpen = 'time';
-    const box = target === '999' ? $('#checkin-999') : $('#checkin-merchant');
+    const box = target === '999' ? $('#checkin-999')
+      : target === 'merchant' ? $('#checkin-merchant')
+      : $('#boss-death');
     const r = box.getBoundingClientRect();
     const now = new Date();
-    const isMerchant = target !== '999';
-    window.mxdApi.popup.show({ anchorX: r.left, width: isMerchant ? 164 : 120, height: 100, focusable: true }); // 需要键盘输入
+    const isMerchant = target === 'merchant';
+    const isBoss = target === 'boss';
+    window.mxdApi.popup.show({ anchorX: r.left, width: isMerchant || isBoss ? 164 : 120, height: 100, focusable: true }); // 需要键盘输入
     window.mxdApi.popup.render({
       kind: 'time',
-      // 999默认当前时分;神秘商人默认 05:59:59(6小时周期刚刷新时确认 → 从 05:59:59 起倒计时)
+      // 999默认当前时分;神秘商人默认 05:59:59(6小时周期刚刷新时确认 → 从 05:59:59 起倒计时);BOSS默认当前时分秒
       hour: isMerchant ? 5 : now.getHours(),
       minute: isMerchant ? 59 : now.getMinutes(),
-      second: isMerchant ? 59 : 0,
-      title: isMerchant ? '刷新剩余时间' : '打卡时间',
+      second: isMerchant ? 59 : isBoss ? now.getSeconds() : 0,
+      title: isMerchant ? '刷新剩余时间' : isBoss ? 'BOSS死亡时间' : '打卡时间',
       maxHour: isMerchant ? 5 : 23, // 商人周期 6 小时,剩余时长最多 5:59:59
-      withSeconds: isMerchant,       // 商人剩余时长精确到秒;999打卡只到分钟
+      withSeconds: isMerchant || isBoss, // 商人剩余时长/BOSS死亡时刻精确到秒;999打卡只到分钟
     });
   }
 
@@ -358,6 +404,12 @@
     const t0 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0).getTime();
     const secOff = nowMs % 60000;
     return t0 <= nowMs ? t0 + secOff : t0 - DAY_MS + secOff;
+  }
+
+  // BOSS专用:选中的时分秒一律锚定当天(允许未来时刻:到点前距离按 0 计,到点后自动开始累计)
+  function bossTimeAnchorOf(hour, minute, second) {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, second || 0, 0).getTime();
   }
 
   // ---------- EXP 双模式 ----------
@@ -590,11 +642,14 @@
         if (action !== 'ok' || !target) return;
         if (target === '999') {
           checkin999Anchor = timeAnchorOf(hour, minute);
-        } else {
+        } else if (target === 'merchant') {
           // 神秘商人:时分秒是"距下次刷新的剩余时长"(0:1:30 = 还剩1分30秒),倒推锚点
           merchantAnchor = Date.now() - (MERCHANT_MS - (hour * 3600 + minute * 60 + (second || 0)) * 1000);
+        } else {
+          // BOSS:时分秒即死亡时刻(一天中的时刻)
+          bossAnchor = bossTimeAnchorOf(hour, minute, second);
         }
-        updateCheckinTimers();
+        updateTimers();
         persistSettings();
       }
     });
@@ -642,14 +697,16 @@
       btn.addEventListener('click', () => openPotionPopup(btn));
     });
 
-    // 999打卡 / 神秘商人 → 打开时分选择器
+    // 999打卡 / 神秘商人 / BOSS计时 → 打开时分(秒)选择器(BOSS点任一标签都设置死亡时刻)
     $('#checkin-999').addEventListener('click', () => openTimePicker('999'));
     $('#checkin-merchant').addEventListener('click', () => openTimePicker('merchant'));
+    $('#boss-death').addEventListener('click', () => openTimePicker('boss'));
+    $('#boss-elapsed').addEventListener('click', () => openTimePicker('boss'));
     // 商人刷新通知:鼠标移到框上 → 停止振动并恢复倒计时
     $('#checkin-merchant').addEventListener('mouseenter', () => {
       merchantRefreshed = false;
       merchantHovered = true;
-      updateCheckinTimers();
+      updateTimers();
     });
     $('#checkin-merchant').addEventListener('mouseleave', () => { merchantHovered = false; });
     // 点击主条其他位置时收起药水面板

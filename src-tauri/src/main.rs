@@ -153,7 +153,7 @@ fn settings_to_ini(v: &Value) -> String {
             .map(|(k, v)| (k.clone(), v.as_i64().unwrap_or(0).to_string()))
             .collect());
     }
-    section("checkin", ["checkin999", "merchant"]
+    section("checkin", ["checkin999", "merchant", "boss"]
         .iter()
         .filter_map(|k| o.get(*k).and_then(|v| v.as_i64()).map(|n| ((*k).to_string(), n.to_string())))
         .collect());
@@ -226,6 +226,7 @@ fn ini_to_settings(text: &str) -> Value {
     out.insert("potions".into(), Value::Object(potions));
     out.insert("checkin999".into(), checkin.get("checkin999").cloned().unwrap_or(Value::Null));
     out.insert("merchant".into(), checkin.get("merchant").cloned().unwrap_or(Value::Null));
+    out.insert("boss".into(), checkin.get("boss").cloned().unwrap_or(Value::Null));
     out.insert("map".into(), Value::Object(map));
     Value::Object(out)
 }
@@ -601,6 +602,16 @@ async fn popup_pick(app: tauri::AppHandle, data: Value) -> Result<(), String> {
     Ok(())
 }
 
+// 面板宽度贴合内容:渲染层量取控件总宽(CSS px)上报,按 DPI 缩放换算为物理像素后调整窗口
+#[tauri::command]
+async fn set_window_width(window: tauri::Window, width: f64) -> Result<(), String> {
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let inner = window.inner_size().map_err(|e| e.to_string())?;
+    window
+        .set_size(PhysicalSize::new((width * scale).round() as u32, inner.height))
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     // 单实例:双击/多开会产生共享同一 user-data-dir 的僵尸 WebView2 浏览器进程,
     // 导致加载失败、悬浮面板定位异常等互扰 → 已运行时直接退出
@@ -642,7 +653,7 @@ fn main() {
             // 主窗口运行时创建(配置窗口无法挂 on_page_load 启动竞态自愈)
             let main = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("冒险岛怀旧服经验记录器")
-                .inner_size(1400.0, 36.0)
+                .inner_size(1600.0, 36.0)
                 .position(100.0, 100.0)
                 .decorations(false)
                 .resizable(false)
@@ -755,7 +766,8 @@ fn main() {
             popup_render,
             popup_close,
             popup_pick,
-            popup_ready
+            popup_ready,
+            set_window_width
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
