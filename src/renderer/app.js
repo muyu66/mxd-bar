@@ -20,6 +20,14 @@
   let timerInterval = null;
   let submitting = false;
 
+  // 吸顶/收缩:拖到屏幕顶部附近 → Rust 贴顶吸附;鼠标离开 3 秒收缩成粗线,悬停还原
+  let snapOn = false;          // Rust 判定:窗口贴合工作区顶部
+  let collapsed = false;       // 已收缩成粗线(仅吸顶态)
+  let hovered = false;         // 鼠标在窗口内
+  let collapseTimer = null;
+  let currentState = 'input';
+  const COLLAPSE_DELAY = 3000;
+
   // 999打卡 / 神秘商人 / BOSS计时(时间戳基准,关闭程序时间照走)
   let checkin999Anchor = null;   // 上次999打卡时刻(ms)
   let merchantAnchor = null;     // 上次神秘商人刷新时刻(ms)
@@ -44,6 +52,13 @@
     populatePotions();
     await applySavedSettings();
     bindEvents();
+    // 吸顶/收缩初始状态(上次停在顶部 → 启动即恢复吸顶,3 秒后照常收缩)
+    try {
+      const snap = await window.mxdApi.getSnapState();
+      snapOn = snap.snapped;
+      setCollapsedClass(snap.collapsed);
+      armCollapse();
+    } catch (e) { /* 桥接缺失时忽略 */ }
     refreshExpUI();
     refreshPartyUI();
     updateTimers();
@@ -204,6 +219,7 @@
     popupOpen = null;
     potionPickerCtx = null;
     window.mxdApi.popup.close();
+    armCollapse(); // 面板占用期间不收缩,关闭后重新计时
   }
 
   // --- 地图面板 ---
@@ -306,6 +322,35 @@
     });
   }
 
+  // ---------- 吸顶 / 收缩 ----------
+  // 仅"待开始记录"状态可收缩;悬浮面板打开(锚在主条下方)时也不收缩
+  function collapsible() {
+    return currentState === 'input' && popupOpen === null;
+  }
+
+  function clearCollapseTimer() {
+    if (collapseTimer) { clearTimeout(collapseTimer); collapseTimer = null; }
+  }
+
+  // 条件齐备则 3 秒后收缩;期间悬停/切状态/开面板都会取消
+  function armCollapse() {
+    clearCollapseTimer();
+    if (!snapOn || !collapsible() || hovered || collapsed) return;
+    collapseTimer = setTimeout(() => {
+      collapseTimer = null;
+      if (snapOn && collapsible() && !hovered && !collapsed) {
+        window.mxdApi.setCollapsed(true); // Rust 侧复核鼠标位置后执行收缩并发回事件
+      }
+    }, COLLAPSE_DELAY);
+  }
+
+  // 收缩/还原的最终形态以 Rust 事件为准(离开吸顶时 Rust 强制还原,这里只同步样式)
+  function setCollapsedClass(c) {
+    collapsed = c;
+    document.body.classList.toggle('collapsed', c);
+    if (c) closePopup();
+  }
+
   // ---------- 999打卡 / 神秘商人 / BOSS计时 倒计时 ----------
   // 时间戳 → 本地时区当天时分秒(epoch 按 UTC 午夜对齐,% DAY_MS 截取会偏 8 小时)
   function formatClockOf(ts) {
@@ -369,6 +414,14 @@
       elBD.textContent = formatClockOf(bossAnchor);
       elBE.classList.remove('idle');
       elBE.textContent = formatElapsed(Math.max(0, Date.now() - bossAnchor)); // 时钟回拨时兜底为 0
+    }
+    // 收缩成粗线时:999 待打卡红闪 / 商人已刷新金闪,同时触发则红金交替闪
+    if (document.body.classList.contains('collapsed')) {
+      const mAlert = merchantRefreshed && !merchantHovered;
+      const cAlert = el999.classList.contains('waiting');
+      document.body.classList.toggle('alert-merchant', mAlert && !cAlert);
+      document.body.classList.toggle('alert-999', cAlert && !mAlert);
+      document.body.classList.toggle('alert-both', mAlert && cAlert);
     }
   }
 
@@ -529,8 +582,15 @@
   // ---------- 状态切换 ----------
   function showState(name) {
     closePopup();
+    currentState = name;
     document.querySelectorAll('.state').forEach((s) => s.classList.add('hidden'));
     $(`#state-${name}`).classList.remove('hidden');
+    // 仅"待开始记录"态允许收缩;计时/结束填写/成功页一律保持展开
+    if (name === 'input') armCollapse();
+    else {
+      clearCollapseTimer();
+      if (collapsed) window.mxdApi.setCollapsed(false);
+    }
   }
 
   function flashInvalid(selector) {
@@ -593,7 +653,8 @@
     let dragState = null;
     document.addEventListener('mousedown', (e) => {
       if (e.button !== 0) return;
-      if (!e.target.closest('.bar')) return;
+      // 收缩成粗线时整条线都可拖动(通常悬停已先还原,此处兜底)
+      if (!e.target.closest('.bar') && !document.body.classList.contains('collapsed')) return;
       if (e.target.closest('input, select, button, .seg')) return; // 控件区域不启动拖动
       dragState = { x: e.screenX, y: e.screenY };
       window.mxdApi.dragStart();
@@ -616,6 +677,41 @@
       // (时分选择器可聚焦、需键盘输入,失焦属正常,不能在此收起)
       if (popupOpen && popupOpen !== 'time') closePopup();
     });
+
+    // ---------- 吸顶/收缩:进出窗口驱动展开与收缩计时 ----------
+    // 从窗口外移入 → 悬停还原(未收缩时 Rust 侧忽略,幂等)
+    document.addEventListener('mouseover', (e) => {
+      if (e.relatedTarget !== null) return;
+      hovered = true;
+      clearCollapseTimer();
+      window.mxdApi.setCollapsed(false);
+    });
+    // Alt+Tab 回窗口时 Chromium 可能不重发 mouseover,任何移动/按下都视为悬停
+    document.addEventListener('mousemove', () => {
+      hovered = true;
+      clearCollapseTimer();
+      if (collapsed) window.mxdApi.setCollapsed(false);
+    });
+    document.addEventListener('mousedown', () => {
+      hovered = true;
+      clearCollapseTimer();
+      if (collapsed) window.mxdApi.setCollapsed(false);
+    });
+    document.addEventListener('mouseout', (e) => {
+      if (e.relatedTarget !== null) return;
+      hovered = false;
+      armCollapse(); // 移出窗口 → 3 秒后收缩
+    });
+    window.addEventListener('blur', () => {
+      hovered = false; // 切回游戏等场景鼠标位置不可知 → 按离开处理
+      armCollapse();
+    });
+    window.mxdApi.onSnapChanged(({ snapped }) => {
+      snapOn = snapped;
+      if (snapped) armCollapse();
+      else { clearCollapseTimer(); setCollapsedClass(false); } // 离开吸顶时 Rust 已强制还原
+    });
+    window.mxdApi.onCollapsedChanged(({ collapsed: c }) => setCollapsedClass(c));
 
     // 悬浮面板回传选择
     window.mxdApi.popup.onPick(({ kind, action, hour, minute, second, mapid, key, itemid }) => {

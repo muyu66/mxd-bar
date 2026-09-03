@@ -319,3 +319,44 @@ input.err, select.err { border-color: var(--danger); animation: shake .3s; }
   25% { transform: translateX(-3px); }
   75% { transform: translateX(3px); }
 }
+
+/* ---------- 吸顶收缩:收缩成一根粗线,提醒时闪亮发光 ---------- */
+body.collapsed #app,
+body.collapsed #btn-close { display: none; }
+#snap-line {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px; /* 与 Rust 侧收缩高度一致(6 CSS px,按 DPI 换算物理像素) */
+  background: linear-gradient(180deg, #262c45, var(--panel));
+  box-shadow: inset 0 0 0 1px var(--line);
+  z-index: 30;
+}
+body.collapsed #snap-line { display: block; }
+/* 999 待打卡:红线闪亮 */
+body.collapsed.alert-999 #snap-line {
+  background: var(--danger);
+  animation: line-blink .9s ease-in-out infinite;
+}
+/* 神秘商人已刷新:金线闪亮 */
+body.collapsed.alert-merchant #snap-line {
+  background: #ffd76a;
+  animation: line-blink .9s ease-in-out infinite;
+}
+/* 同时提醒:红金交替闪 */
+body.collapsed.alert-both #snap-line { animation: line-alt 1.8s ease-in-out infinite; }
+@keyframes line-blink {
+  0%, 100% { opacity: .35; }
+  50% {
+    opacity: 1;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .5), 0 2px 10px 1px rgba(255, 255, 255, .35);
+  }
+}
+@keyframes line-alt {
+  0%, 24%   { background: var(--danger); opacity: .5; }
+  25%, 49%  { background: var(--danger); opacity: 1; }
+  50%, 74%  { background: #ffd76a; opacity: .5; }
+  75%, 100% { background: #ffd76a; opacity: 1; }
+}

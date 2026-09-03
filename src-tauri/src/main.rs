@@ -18,8 +18,11 @@ use tauri_plugin_opener::OpenerExt;
 static DATA: Dir = include_dir!("$CARGO_MANIFEST_DIR/../data");
 
 const SETTINGS_FILE: &str = "settings.ini";          // 设置以 INI 存储,便于手工查看/修改
-const SETTINGS_JSON_LEGACY: &str = "settings.json";   // 旧 Electron 版格式,首次启动自动迁移
+const SETTINGS_JSON_LEGACY: &str = "settings.json";   // 旧 Electron 版格式,迁移完成后改名为 settings.json.migrated 留档
 const APP_ID_FILE: &str = "device-id.json";
+
+const SNAP_THRESHOLD: i32 = 24;     // 窗口顶边距工作区顶 ≤24px 视为"拖到顶部附近" → 吸顶
+const COLLAPSED_H_CSS: f64 = 6.0;   // 收缩后的粗线高度(CSS px,按 DPI 换算物理像素)
 
 struct AppState {
     base_dir: PathBuf,
@@ -30,6 +33,9 @@ struct AppState {
     popup_focusable: AtomicBool, // 时间选择器面板需要键盘输入,临时可聚焦
     pending_render: Mutex<Option<Value>>,
     load_heal: AtomicU32, // 启动竞态自愈次数(页面被代理/DNS 劫持时重新导航,最多 3 次)
+    snap_on: AtomicBool,                 // 吸顶模式:窗口贴合屏幕工作区顶部
+    collapsed: AtomicBool,               // 已收缩成粗线(仅吸顶模式下存在)
+    expanded_height: Mutex<Option<u32>>, // 收缩前外框高度,还原用
 }
 
 // ---------- 启动竞态自愈 ----------
@@ -89,20 +95,62 @@ fn load_device_id(base: &Path) -> String {
 
 // ---------- 用户设置持久化(%APPDATA%\mxd-exp-recorder\settings.ini) ----------
 // 设置以 INI 格式落盘(999打卡/神秘商人时间戳等可直接手工编辑);内存中仍为原 JSON 结构,渲染层无感知
+// settings.json 存在即视为"未迁移"。早期 Tauri 版可能已用默认值落盘 settings.ini,
+// 仅凭"ini 不存在"判断会永远跳过迁移,把老数据挡在门外(等级/999打卡显示默认值)。
+// 规则:ini 缺失或解析结果是纯默认值空壳 → 老数据整体接管;否则只补 ini 中缺失/为空的字段。
+// 迁移成功后把 settings.json 改名为 .migrated 留档,避免后续每次启动都用旧值覆盖新改的值。
 fn load_settings(base: &Path) -> Value {
     let ini = base.join(SETTINGS_FILE);
-    if let Ok(text) = std::fs::read_to_string(&ini) {
-        return ini_to_settings(&text);
-    }
-    // 迁移:旧 Electron 版 settings.json → settings.ini(原文件保留)
     let legacy = base.join(SETTINGS_JSON_LEGACY);
-    if let Ok(text) = std::fs::read_to_string(&legacy) {
-        if let Ok(v) = serde_json::from_str::<Value>(&text) {
-            let _ = std::fs::write(&ini, settings_to_ini(&v));
-            return v;
+    let legacy_val = std::fs::read_to_string(&legacy)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let mut current = std::fs::read_to_string(&ini)
+        .ok()
+        .map(|t| ini_to_settings(&t))
+        .unwrap_or_else(|| json!({}));
+    let Some(lv) = legacy_val else { return current };
+    if let Value::Object(dst) = &mut current {
+        let src = lv.as_object().cloned().unwrap_or_default();
+        if ini_is_defaults(dst) {
+            // ini 是早期版本以默认值落盘的空壳,老数据整体接管
+            *dst = src;
+        } else {
+            // ini 已有用户新数据,只补缺失/空字段(空壳时被默认值挡住的字段由上面分支兜底)
+            for (k, v) in &src {
+                if dst.get(k).map_or(true, is_blank) && !is_blank(v) {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
         }
     }
-    json!({})
+    let _ = std::fs::write(&ini, settings_to_ini(&current));
+    let _ = std::fs::rename(&legacy, base.join(format!("{SETTINGS_JSON_LEGACY}.migrated")));
+    current
+}
+
+// ini 解析结果是否为纯默认值空壳(无任何真实用户数据,不含 window:窗口位置随时会被移动事件重写)
+fn ini_is_defaults(v: &Map<String, Value>) -> bool {
+    v.get("level").and_then(|x| x.as_i64()) == Some(1)
+        && v.get("outLevel").and_then(|x| x.as_i64()) == Some(1)
+        && v.get("job").and_then(|x| x.as_str()).unwrap_or("").is_empty()
+        && v.get("checkin999").map_or(true, |x| x.is_null())
+        && v.get("merchant").map_or(true, |x| x.is_null())
+        && v.get("boss").map_or(true, |x| x.is_null())
+        && v.get("potions").and_then(|x| x.as_object()).map_or(true, |o| o.is_empty())
+        && v.get("map").and_then(|x| x.as_object()).map_or(true, |o| o.is_empty())
+}
+
+// 值为空(Null/空串/空对象/全零数组/等级默认值 1)视为"未设置"
+fn is_blank(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        Value::Array(a) => a.is_empty() || a.iter().all(|x| x.as_i64() == Some(0)),
+        Value::Number(n) => n.as_i64() == Some(1),
+        _ => false,
+    }
 }
 
 fn save_settings_patch(app: &tauri::AppHandle, patch: Value) {
@@ -442,6 +490,71 @@ fn hide_raw(popup: &tauri::WebviewWindow) {
     }
 }
 
+// ---------- 吸顶 / 收缩 ----------
+// 吸顶:窗口拖到工作区顶部 24px 内 → 贴顶吸附,阈值内拖动被吸住;拖离 → 退出。
+// 收缩:吸顶且鼠标不在窗口内 3 秒(由渲染层计时)→ 高度收成一根粗线,悬停还原。
+// 粗线模式下 999 打卡 / 神秘商人的提醒由渲染层在线上闪亮发光呈现。
+static COLLAPSE_LOCK: Mutex<()> = Mutex::new(()); // 串行化收缩/还原,防并发竞态
+
+fn collapse_line_height(window: &tauri::Window) -> u32 {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    ((COLLAPSED_H_CSS * scale).round() as u32).max(4)
+}
+
+// 鼠标此刻是否停在窗口内:收缩前复核,防"计时器刚触发、鼠标恰好进入"竞态
+#[cfg(windows)]
+fn cursor_over(window: &tauri::Window) -> bool {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let (Ok(p), Ok(s)) = (window.outer_position(), window.outer_size()) else {
+        return false;
+    };
+    let mut pt = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut pt) } == 0 {
+        return false;
+    }
+    pt.x >= p.x && pt.x < p.x + s.width as i32 && pt.y >= p.y && pt.y < p.y + s.height as i32
+}
+#[cfg(not(windows))]
+fn cursor_over(_window: &tauri::Window) -> bool {
+    false
+}
+
+// 还原收缩前高度;未收缩时无操作。发事件让渲染层同步样式
+fn restore_height(window: &tauri::WebviewWindow, state: &AppState) {
+    if !state.collapsed.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(size) = window.inner_size() {
+        let h = state.expanded_height.lock().unwrap().unwrap_or(size.height);
+        let _ = window.set_size(PhysicalSize::new(size.width, h));
+    }
+    let _ = window.emit("collapsed-changed", json!({ "collapsed": false }));
+}
+
+// Moved 时判定吸顶;贴顶/还原高度(左上角锚定 → 窗口始终向下展开,顶边不动)
+fn eval_snap(window: &tauri::WebviewWindow) {
+    let state = window.app_handle().state::<AppState>();
+    let Ok(pos) = window.outer_position() else { return };
+    let Ok(Some(mon)) = window.current_monitor() else { return };
+    let top = mon.work_area().position.y;
+    let near_top = pos.y - top <= SNAP_THRESHOLD;
+    let snapped = state.snap_on.load(Ordering::SeqCst);
+    if near_top && !snapped {
+        state.snap_on.store(true, Ordering::SeqCst);
+        if pos.y != top {
+            let _ = window.set_position(PhysicalPosition::new(pos.x, top));
+        }
+        let _ = window.emit("snap-changed", json!({ "snapped": true }));
+    } else if !near_top && snapped {
+        state.snap_on.store(false, Ordering::SeqCst);
+        restore_height(window, &state); // 离开吸顶必须还原(粗线只在吸顶态存在)
+        let _ = window.emit("snap-changed", json!({ "snapped": false }));
+    } else if near_top && snapped && pos.y != top {
+        let _ = window.set_position(PhysicalPosition::new(pos.x, top)); // 阈值内拖回贴顶
+    }
+}
+
 // ---------- IPC 命令(与原 Electron 版同名语义) ----------
 // 注意:同步命令跑在主线程,而窗口 API(outer_position/建窗等)要等事件循环回包,
 // 从主线程调用会死锁 → 全部命令一律 async,跑在 tokio 工作线程
@@ -612,6 +725,58 @@ async fn set_window_width(window: tauri::Window, width: f64) -> Result<(), Strin
         .map_err(|e| e.to_string())
 }
 
+// 吸顶收缩:仅吸顶模式可收缩;还原任意时刻可调(未收缩时忽略)
+#[tauri::command]
+async fn set_collapsed(
+    window: tauri::Window,
+    state: tauri::State<'_, AppState>,
+    collapsed: bool,
+) -> Result<(), String> {
+    let _guard = COLLAPSE_LOCK.lock().unwrap(); // 与收缩/还原互斥,保证先后顺序
+    let app = window.app_handle();
+    let main = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    if collapsed {
+        // 非吸顶 / 已收缩 / 鼠标正悬停 → 忽略(悬停复核防计时器竞态)
+        if !state.snap_on.load(Ordering::SeqCst)
+            || state.collapsed.load(Ordering::SeqCst)
+            || cursor_over(&window)
+        {
+            return Ok(());
+        }
+        // 存内尺寸而非外尺寸:外尺寸(GetWindowRect)含 DWM 阴影,还原时会把阴影算进真实高度
+        let size = window.inner_size().map_err(|e| e.to_string())?;
+        *state.expanded_height.lock().unwrap() = Some(size.height);
+        window
+            .set_size(PhysicalSize::new(size.width, collapse_line_height(&window)))
+            .map_err(|e| e.to_string())?;
+        // 左上角锚定:变矮后顶边不动 → 向下收成细线,仍贴合顶部
+        if let (Ok(p), Ok(Some(m))) = (window.outer_position(), window.current_monitor()) {
+            let top = m.work_area().position.y;
+            if p.y != top {
+                let _ = window.set_position(PhysicalPosition::new(p.x, top));
+            }
+        }
+        // 主条没了,锚在其下方的悬浮面板一并收起
+        if let Some(popup) = app.get_webview_window("popup") {
+            hide_raw(&popup);
+        }
+        state.collapsed.store(true, Ordering::SeqCst);
+        let _ = main.emit("collapsed-changed", json!({ "collapsed": true }));
+    } else {
+        restore_height(&main, &state);
+    }
+    Ok(())
+}
+
+// 渲染层初始化时拉取吸顶/收缩现状(启动即吸顶时页面可能错过事件)
+#[tauri::command]
+async fn get_snap_state(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    Ok(json!({
+        "snapped": state.snap_on.load(Ordering::SeqCst),
+        "collapsed": state.collapsed.load(Ordering::SeqCst),
+    }))
+}
+
 fn main() {
     // 单实例:双击/多开会产生共享同一 user-data-dir 的僵尸 WebView2 浏览器进程,
     // 导致加载失败、悬浮面板定位异常等互扰 → 已运行时直接退出
@@ -648,6 +813,9 @@ fn main() {
                 popup_focusable: AtomicBool::new(false),
                 pending_render: Mutex::new(None),
                 load_heal: AtomicU32::new(0),
+                snap_on: AtomicBool::new(false),
+                collapsed: AtomicBool::new(false),
+                expanded_height: Mutex::new(None),
             });
 
             // 主窗口运行时创建(配置窗口无法挂 on_page_load 启动竞态自愈)
@@ -661,9 +829,30 @@ fn main() {
                 .minimizable(false)
                 .always_on_top(true)
                 .skip_taskbar(true)
+                // 无边框窗口默认带 DWM 阴影+隐形边框(GetWindowRect 比客户区大一圈),
+                // 收缩成 6px 粗线时下方会拖出一片半透明阴影 → 关掉
+                .shadow(false)
                 .additional_browser_args("--no-proxy-server")
                 .on_page_load(|webview, payload| heal_page_load(&webview, payload.url().as_str(), "index.html"))
                 .build()?;
+            // 关阴影后 Win11 不再默认圆角 → 显式请求圆角(老系统不支持时忽略)
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::Graphics::Dwm::{
+                    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+                };
+                if let Ok(hwnd) = main.hwnd() {
+                    let pref = DWMWCP_ROUND;
+                    unsafe {
+                        DwmSetWindowAttribute(
+                            hwnd.0 as *mut _,
+                            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                            &pref as *const _ as *const _,
+                            std::mem::size_of_val(&pref) as u32,
+                        );
+                    }
+                }
+            }
             {
                 // 恢复上次窗口位置(须仍在屏幕工作区内,否则忽略)
                 if let Some(wp) = app.state::<AppState>().settings.lock().unwrap().get("window").and_then(|v| v.as_array()).cloned() {
@@ -714,6 +903,7 @@ fn main() {
                             if let Some(popup) = app.get_webview_window("popup") {
                                 hide_raw(&popup);
                             }
+                            eval_snap(&main2); // 拖动贴顶/拖离的吸顶切换
                         }
                         WindowEvent::CloseRequested { .. } => {
                             if let Ok(p) = main2.outer_position() {
@@ -728,6 +918,9 @@ fn main() {
                     }
                 });
             }
+
+            // 上次位置贴近顶部 → 启动即恢复吸顶(事件此时无页面接收,渲染层用 get_snap_state 同步)
+            eval_snap(&main);
 
             // 开发冒烟测试:验证 saveRecord 写入、deviceId 与内嵌数据完整性,随后退出
             if std::env::args().any(|a| a == "--smoke-test") {
@@ -767,7 +960,9 @@ fn main() {
             popup_close,
             popup_pick,
             popup_ready,
-            set_window_width
+            set_window_width,
+            set_collapsed,
+            get_snap_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

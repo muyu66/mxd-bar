@@ -27,6 +27,11 @@
     dragMove: (dx, dy) => invoke('drag_move', { dx, dy }),
     dragEnd: () => invoke('drag_end'),
     setWindowWidth: (width) => invoke('set_window_width', { width }),
+    // 吸顶收缩:Rust 侧执行收缩/还原并发回事件,这里只负责发起与监听
+    setCollapsed: (collapsed) => invoke('set_collapsed', { collapsed }),
+    getSnapState: () => invoke('get_snap_state'),
+    onSnapChanged: (cb) => listen('snap-changed', (e) => cb(e.payload)),
+    onCollapsedChanged: (cb) => listen('collapsed-changed', (e) => cb(e.payload)),
     // 悬浮面板(主条窗口用 show/render/close/onPick,面板小窗用 onRender/pick/ready)
     popup: {
       show: (opts) => invoke('popup_show', { opts }),
