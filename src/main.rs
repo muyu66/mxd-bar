@@ -102,7 +102,7 @@ fn main() -> eframe::Result {
                         let p = serde_json::json!({
                             "exp_per_hour": 0, "job": "测试", "level": 1,
                             "map": "测试地图", "mode": "solo", "power": 1,
-                            "note": "mxd-bar --nettest", "test_seconds": 5,
+                            "note": "mxd-bar --nettest", "vip": false, "test_seconds": 5,
                         });
                         match crate::net::post_report(base, &tok, &p) {
                             Ok(id) => eprintln!(

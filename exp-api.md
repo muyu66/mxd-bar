@@ -273,7 +273,7 @@ curl -X POST "https://你的域名/api/exp/report" \
 
 v1（上文 §1~§8）服务端全权重算、上报即快照、只增不改。v2 面向**新版精简协议**与**页面编辑**：
 
-- 上报体是 snake_case 的**每小时值直接上报**（`exp_per_hour` 等），不再发金币/药水（入库对应列留 NULL，页面显示 `-`），新增 **备注** 与 **攻击力/魔法力** 两个可选字段。
+- 上报体是 snake_case 的**每小时值直接上报**（`exp_per_hour` 等），不再发金币/药水（入库对应列留 NULL，页面显示 `-`），新增 **备注**、**攻击力/魔法力** 两个可选字段，以及 **会员** `vip`（有会员 `true` / 无会员 `false`，缺省按无会员）。
 - 鉴权用 **JWT**：客户端先拿设备密钥换 2h token，之后所有请求带 `Authorization: Bearer <token>`；JWT 的 `sub` 即**设备ID**，服务端以它为 device_id 落库（不信 body 里的设备字段）。
 - **编辑能力**：`exp.html` 通过带 `?token=` 的链接打开后，前端调 session 接口确认授权设备，该设备上报的行出现可点的「编辑」按钮，走 PATCH 就地修改。token 只授权修改**本设备**的记录。
 
@@ -331,6 +331,7 @@ v1（上文 §1~§8）服务端全权重算、上报即快照、只增不改。v
   "mode": "solo",
   "note": "免费测试期",
   "power": 122,
+  "vip": false,
   "test_seconds": 1800
 }
 ```
@@ -346,6 +347,7 @@ v1（上文 §1~§8）服务端全权重算、上报即快照、只增不改。v
 | `mode` ★ | string | 英文字母 `solo`/`party` | `party_mode` | 组队与否（中文会被拒） |
 | `note` ✎ | string | ≤500 字符，空串按无 | `note`（新列） | 备注 |
 | `power` ✎ | integer | 0 ~ 1e9 | `power`（新列） | 攻击力/魔法力 |
+| `vip` ✎ | bool | `true`/`false`（缺省按 `false`） | `vip`（新列） | 是否有会员（有会员加成） |
 | `test_seconds` ★ | number | 0 ~ 21600（**0 合法**） | `duration_seconds` | 本次测试/刷怪秒数 |
 
 服务端校验通过后以 JWT `sub` 为 device_id 落库，delta/金币/药水相关列一律 NULL。成功 `200`：

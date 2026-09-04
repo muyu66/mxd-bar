@@ -51,7 +51,7 @@ pub fn page(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, kind: TimePickKind) 
                         .add_sized(
                             [72.0, 28.0],
                             egui::Button::new(RichText::new("确定").strong())
-                                .fill(crate::theme::ORANGE),
+                                .fill(crate::theme::ORANGE_DEEP),
                         )
                         .clicked()
                     {

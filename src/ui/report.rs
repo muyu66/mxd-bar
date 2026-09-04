@@ -3,7 +3,7 @@
 //! 页面自身不做固定高度/滚动：整块内容自上而下自然排布，由 app.rs 量出实际高度
 //! 去适配窗口（"高度自适应"）。表单排成固定两行：
 //! 第一行 = 等级｜职业｜地图｜攻击力(或魔法力)｜模式（除备注、按钮外的全部字段）；
-//! 第二行 = 备注 ＋ 取消/确认提交（按钮右对齐）。
+//! 第二行 = 会员开关(无会员/有会员) ＋ 备注 ＋ 取消/确认提交（按钮右对齐）。
 //! 地图联想列在地图栏正下方，点选即填入（仅输入中短暂出现，不常驻）。
 //! 只有「确认提交」是橘黄重点按钮；成功页里只有「前往查看」是橘黄重点按钮。
 //! 成功页没有图标：顶部是绿色分享网址，下方「返回 / 前往查看」两钮；
@@ -119,12 +119,15 @@ fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, kick: &mut Opt
     // 平时不占位，保证整页稳定在两行）。
     map_suggestions(ui, g, map_x);
 
-    // —— 第二行：备注（占左）+ 取消/确认提交（右对齐）——
+    // —— 第二行：会员开关（最左）＋ 备注（占左）＋ 取消/确认提交（右对齐）——
     ui.add_space(12.0);
     let busy = g.report.submitting;
     let confirm_w = 124.0;
     let cancel_w = 88.0;
-    // 备注编辑宽 = 总宽 − "备注"标签 − 取消 − 确认 − 3 个横向自动间距。
+    let vip_chip_w = 50.0; // 会员小片宽
+    let vip_gap = 4.0; // 无会员/有会员 两片之间的空隙
+    let vip_w = 2.0 * vip_chip_w + vip_gap; // 会员开关整组宽
+    // 备注编辑宽 = 总宽 − 会员开关 − "备注"标签 − 取消 − 确认 − 4 个横向自动间距。
     let lab_w = ui
         .painter()
         .layout_no_wrap(
@@ -134,8 +137,9 @@ fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, kick: &mut Opt
         )
         .size()
         .x;
-    let note_w = (total - lab_w - cancel_w - confirm_w - 3.0 * gap).max(120.0);
+    let note_w = (total - vip_w - lab_w - cancel_w - confirm_w - 4.0 * gap).max(120.0);
     ui.horizontal(|ui| {
+        vip_pick(ui, g, vip_chip_w);
         ui.label(RichText::new("备注").weak());
         note_edit(ui, g, note_w);
         if ui.add_sized([cancel_w, 30.0], egui::Button::new("取消")).clicked() {
@@ -144,7 +148,7 @@ fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, kick: &mut Opt
         let label = if busy { "提交中…" } else { "确认提交" };
         let resp = ui.add_sized(
             [confirm_w, 30.0],
-            egui::Button::new(RichText::new(label).strong()).fill(theme::ORANGE),
+            egui::Button::new(RichText::new(label).strong()).fill(theme::ORANGE_DEEP),
         );
         if busy {
             resp.on_hover_text("正在联网上报，请稍候");
@@ -192,27 +196,39 @@ fn map_suggestions(ui: &mut egui::Ui, g: &mut Shared, indent: f32) {
         return;
     }
 
+    // 候选列表的滚动内容方向跟 ScrollArea 的直接父 ui 走：若像旧实现那样整体套进
+    // `ui.horizontal`，候选会被排成横的一行（只在可视宽度里露出最左的一两个，其余被截掉）。
+    // 因此在横排（负责把起点推到"地图"列）里再嵌一块竖排子区，让候选从上到下逐条排。
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         ui.add_space(indent);
         let avail = ui.available_width();
         let sw = avail.clamp(200.0, 360.0);
-        ScrollArea::vertical()
-            .id_salt("map_hits")
-            .max_height(150.0)
-            .min_scrolled_width(sw)
-            .show(ui, |ui| {
-                for m in hits.iter().take(10) {
-                    let name = m.name.clone();
-                    if ui
-                        .add_sized([sw, 24.0], egui::Button::new(name))
-                        .on_hover_text("点击填入")
-                        .clicked()
-                    {
-                        g.report.map_query = m.name.clone();
+        let n = hits.len().min(10);
+        let item_h = 24.0; // 单项高
+        let gap = 2.0; // 项间距
+        // 列表最大 150（约 6 项），超出滚轮滚动。按项数预留精确高度：既保证上方留白一致，
+        // 又不会在候选少于整高时留下大块空白把下方按钮行顶得很远。
+        let box_h = ((n as f32) * item_h + (n as f32 - 1.0) * gap).min(150.0);
+        ui.allocate_ui_with_layout(vec2(sw, box_h), Layout::top_down(Align::Min), |v| {
+            v.spacing_mut().item_spacing = vec2(0.0, gap);
+            ScrollArea::vertical()
+                .id_salt("map_hits")
+                .max_height(box_h)
+                .content_margin(egui::Margin::ZERO)
+                .show(v, |v| {
+                    for m in hits.iter().take(n) {
+                        let name = m.name.clone();
+                        if v
+                            .add_sized([sw, item_h], egui::Button::new(name))
+                            .on_hover_text("点击填入")
+                            .clicked()
+                        {
+                            g.report.map_query = m.name.clone();
+                        }
                     }
-                }
-            });
+                });
+        });
     });
 }
 
@@ -265,6 +281,7 @@ fn build_payload(g: &mut Shared) -> Result<ReportPayload, String> {
         mode_solo: g.report.mode_solo,
         power,
         note: g.report.note.clone(),
+        vip: g.report.vip,
         exp_per_hour: g.report.exp_per_hour,
         exp_seconds: g.report.exp_seconds,
     })
@@ -314,6 +331,23 @@ fn mode_pick(ui: &mut egui::Ui, g: &mut Shared) {
     });
 }
 
+/// 会员开关：无会员 / 有会员 两枚等宽小片（默认无会员）。
+/// 选中的那枚用橘黄高亮，与整页重点色一致；点击即切换 `report.vip`。
+fn vip_pick(ui: &mut egui::Ui, g: &mut Shared, chip_w: f32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+        for (sel, label) in [(false, "无会员"), (true, "有会员")] {
+            let mut btn = egui::Button::new(RichText::new(label).size(12.0));
+            if g.report.vip == sel {
+                btn = btn.fill(theme::ORANGE_DEEP);
+            }
+            if ui.add_sized([chip_w, 24.0], btn).clicked() {
+                g.report.vip = sel;
+            }
+        }
+    });
+}
+
 /// 备注：≤20 字符，输入途中超限立刻截断。`width` = 编辑框宽度（第二行左区，占满到按钮前）。
 fn note_edit(ui: &mut egui::Ui, g: &mut Shared, width: f32) {
     let cap = g.report.note.chars().take(20).collect::<String>();
@@ -348,6 +382,7 @@ fn report_json(p: &ReportPayload) -> serde_json::Value {
         "mode": if p.mode_solo { "solo" } else { "party" },
         "power": p.power,
         "note": p.note,
+        "vip": p.vip,
         "test_seconds": p.exp_seconds,
     })
 }
@@ -451,7 +486,7 @@ fn draw_success(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, open: &mut 
         if ui
             .add_sized(
                 [bw, 30.0],
-                egui::Button::new(RichText::new("前往查看").strong()).fill(theme::ORANGE),
+                egui::Button::new(RichText::new("前往查看").strong()).fill(theme::ORANGE_DEEP),
             )
             .clicked()
         {

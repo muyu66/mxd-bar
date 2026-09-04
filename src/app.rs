@@ -39,10 +39,11 @@ pub(crate) const INITIAL_WIDTH: f32 = BAR_W;
 // —— 布局间距（逻辑像素）——
 const PAD_X: f32 = 14.0; // 卡片左右内边距
 const COL_GAP: f32 = 9.0; // 分隔线两侧的间距
-const VAL_GAP: f32 = 3.0; // 指标区 标签→数值 间距
+const VAL_GAP: f32 = 8.0; // 指标区 标签→数值 间距
 const COLPAD: f32 = 6.0; // 指标区文字两侧留白
 
-const BTN_H: f32 = 26.0; // 按钮高（胶囊：圆角 = 半高）
+const BTN_H: f32 = 26.0; // 按钮高
+const BTN_RADIUS: f32 = 6.0; // 按钮圆角（用户 2026-09-04 定稿：比全胶囊小，呈圆角矩形）
 const BTN_ROW_GAP: f32 = 6.0; // 按钮行距
 const BTN_COL_GAP: f32 = 8.0; // 按钮列距
 const BTN_PAD_X: f32 = 14.0; // 每个按钮横向额外留白(两侧合计)
@@ -184,7 +185,7 @@ impl MxdBarApp {
         let time = ctx.input(|i| i.time);
 
         // —— 字体 ——
-        let font_label = FontId::proportional(11.0);
+        let font_label = FontId::proportional(13.0);
         let font_value = FontId::monospace(20.0);
         let font_btn = FontId::proportional(12.0);
 
@@ -703,8 +704,8 @@ fn paint_button(
     };
     let rect = rect.translate(vec2(dx, 0.0));
 
-    // 胶囊：圆角 = 半高，两端成圆弧。常态再叠一条贴顶的淡高光，呈轻微"凸起"。
-    let radius = (rect.height() * 0.5).max(4.0);
+    // 圆角矩形（圆角 = BTN_RADIUS，不再全胶囊）。常态再叠一条贴顶的淡高光，呈轻微"凸起"。
+    let radius = BTN_RADIUS;
     painter.rect_filled(rect, radius, fill);
     painter.rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
     if !resp.is_pointer_button_down_on() {

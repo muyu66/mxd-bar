@@ -6,8 +6,11 @@ use std::sync::Arc;
 use eframe::egui;
 use egui::{Color32, FontData, FontDefinitions, FontFamily, Stroke};
 
-/// 主按钮橘黄。
+/// 主按钮橘黄（用作纯文字/小强调，亮度高的场合）。
 pub const ORANGE: Color32 = Color32::from_rgb(255, 152, 51);
+/// 深橘黄实心底：白字压在橘黄上的大面积底色（选中态 / 重点按钮实心）用这个。
+/// 白字对比约 4.8:1，不像亮橘（~2.1:1）那样发糊刺眼；橘黄纯文字仍用 `ORANGE`。
+pub const ORANGE_DEEP: Color32 = Color32::from_rgb(180, 83, 9);
 /// 成功/已刷新绿。
 pub const SUCCESS: Color32 = Color32::from_rgb(92, 235, 150);
 /// 危险/待打卡红。
@@ -77,10 +80,10 @@ impl Palette {
             btn_active: Color32::from_rgb(87, 103, 135),
             btn_border: Color32::from_rgba_unmultiplied(160, 180, 220, 70),
             btn_text: Color32::from_rgb(242, 245, 250),
-            // 橘黄重点按钮（常态略压一档，悬停抬到亮橘）
-            prim_bg: Color32::from_rgb(226, 126, 18),
-            prim_hover: Color32::from_rgb(255, 153, 51),
-            prim_active: Color32::from_rgb(255, 176, 84),
+            // 橘黄重点按钮：整段用深橘渐变，白字不再压亮橘（悬停略提亮、按下最深）
+            prim_bg: Color32::from_rgb(180, 83, 9),
+            prim_hover: Color32::from_rgb(204, 104, 14),
+            prim_active: Color32::from_rgb(150, 66, 8),
             prim_border: Color32::from_rgba_unmultiplied(255, 180, 100, 140),
             success: SUCCESS,
             danger: DANGER,
@@ -151,9 +154,9 @@ pub fn apply_ui_style(ctx: &egui::Context) {
     v.extreme_bg_color = Color32::from_rgb(12, 15, 22);
     v.faint_bg_color = Color32::from_rgb(28, 34, 48);
     v.override_text_color = Some(Color32::from_rgb(226, 230, 238));
-    // 光标/选区用橘黄强调
-    v.selection.bg_fill = ORANGE;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    // 光标/选区：选中底用深橘黄（白字能看清），描边用柔和的浅橘
+    v.selection.bg_fill = ORANGE_DEEP;
+    v.selection.stroke = Stroke::new(1.0, Color32::from_rgb(255, 190, 120));
     v.hyperlink_color = ORANGE;
 
     for w in [
@@ -168,7 +171,7 @@ pub fn apply_ui_style(ctx: &egui::Context) {
         w.bg_fill = Color32::from_rgb(38, 46, 64);
         w.fg_stroke.color = Color32::from_rgb(226, 230, 238);
     }
-    // 按钮统一中性色，白字。橘黄"重点按钮"由调用方显式 .fill(theme::ORANGE) 给出
+    // 按钮统一中性色，白字。橘黄"重点按钮"由调用方显式 .fill(theme::ORANGE_DEEP) 给出
     //（egui 标准 Button：确认提交/确定；主卡的"上报数据"用自绘重点配色）。
     v.widgets.inactive.fg_stroke.color = Color32::WHITE;
     v.widgets.hovered.fg_stroke.color = Color32::WHITE;

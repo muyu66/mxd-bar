@@ -107,6 +107,8 @@ pub struct ReportPayload {
     pub mode_solo: bool,
     pub power: u64,
     pub note: String,
+    /// 有会员 = true；无会员 = false。
+    pub vip: bool,
     /// 打开上报页那一刻缓存的 预估EXP/时。
     pub exp_per_hour: i64,
     /// 对应的"实测刷怪秒数"（窗内采样条数 × 5s）。
@@ -126,6 +128,8 @@ pub struct ReportState {
     pub map_query: String,
     /// true=单人。
     pub mode_solo: bool,
+    /// 有会员 = true；无会员 = false（打开页面默认无会员）。
+    pub vip: bool,
     /// 攻击力/魔法力（正整数文本；标签由 job 组决定）。
     pub power: String,
     /// 备注 ≤20 字符。
@@ -228,6 +232,7 @@ impl Shared {
             job: sel.1,
             map_query: map,
             mode_solo: solo,
+            vip: false,
             power: (power > 0).then(|| power.to_string()).unwrap_or_default(),
             note: String::new(),
             err: String::new(),
