@@ -28,6 +28,10 @@ pub struct Palette {
     pub exp_per_min: Color32,
     /// “预估EXP/时” 数值颜色
     pub exp_per_hour: Color32,
+    /// 主卡"心电图"折线颜色（相对均值波动）。
+    pub wave: Color32,
+    /// 心电图中线（0 = 窗口均值）的颜色，比折线淡。
+    pub wave_axis: Color32,
     /// 按钮底色
     pub btn_bg: Color32,
     /// 按钮悬停底色
@@ -64,6 +68,9 @@ impl Palette {
             label: Color32::from_rgba_unmultiplied(148, 165, 200, 255),
             exp_per_min: Color32::from_rgb(110, 226, 255),
             exp_per_hour: ORANGE,
+            // 心电图：折线用淡绿，中线再淡一档（表达"0 = 这 1 分钟的均值"）。
+            wave: Color32::from_rgb(120, 222, 172),
+            wave_axis: Color32::from_rgba_unmultiplied(120, 222, 172, 70),
             // 普通按钮 = 中性暗底；只有重点按钮（主卡"上报数据"、页面"确认/确定"）用橘黄
             btn_bg: Color32::from_rgb(43, 52, 71),
             btn_hover: Color32::from_rgb(58, 70, 94),

@@ -1,12 +1,13 @@
 //! mxd-bar 应用主体：一个置顶、无边框、透明的悬浮卡片。
 //!
-//! 主卡固定 72px 高、固定 `BAR_W`(=560px) 宽；当某页打开（上报数据 / 999打卡·神秘商人·BOSS
+//! 主卡固定 72px 高、固定 `BAR_W`(=680px) 宽；当某页打开（上报数据 / 999打卡·神秘商人·BOSS
 //! 的时分选择）时，卡片在**同一窗口**内向下方平滑展开，页面内容滑出在主卡下方（不再是
 //! 独立弹框，主卡也始终可见）。高度按页面实际内容自动适配（测量后动画趋近）；**宽度固定**，
 //! 内部的数字/倒计时等 live 文案在各自固定区域内自适应（居中，必要时缩小字号），
 //! 因此外框宽度不会随内容长短抖动。
 //!
-//! 布局：主卡从左到右 —— ①实时EXP/分 ②预估EXP/时 ③按钮区
+//! 布局：主卡从左到右 —— ①实时EXP/分 ②预估EXP/时 ③心电区 ④按钮区 ⑤工具列
+//! 心电区画近 1 分钟"每 5s 净增 EXP"相对该分钟均值的波动折线（见 paint_wave）。
 //! 按钮区分两行（上报数据/管理数据/BOSS、神秘商人/999打卡），其中只有「上报数据」
 //! 是橘黄重点按钮；最右是两枚小工具图标（无边框、各占一行）——上：退出 X；下：
 //! 刷新 = 清空 实时/预估经验队列（采样从新样本重新累积）。
@@ -22,7 +23,7 @@ use egui::{
     ViewportCommand,
 };
 
-use crate::state::{ExpMetrics, Page, PickState, Shared, TimePickKind};
+use crate::state::{ExpMetrics, Page, PickState, Shared, TimePickKind, SPARK_BUCKETS};
 use crate::theme::Palette;
 use crate::ui::{pickers, report};
 use crate::util::{thousands, TimerUi};
@@ -30,8 +31,8 @@ use crate::util::{thousands, TimerUi};
 /// 卡片总高（逻辑像素）。
 pub const BAR_HEIGHT: f32 = 72.0;
 
-/// 主卡固定总宽（逻辑像素）。外框恒定、内部文案自适应（用户 2026-09-04 定稿：写死约 560）。
-pub const BAR_W: f32 = 560.0;
+/// 主卡固定总宽（逻辑像素）。外框恒定、内部文案自适应（用户 2026-09-04 定稿：写死约 680）。
+pub const BAR_W: f32 = 680.0;
 /// 首次创建窗口的占位宽度（首帧后即按 BAR_W 修正）。
 pub(crate) const INITIAL_WIDTH: f32 = BAR_W;
 
@@ -50,11 +51,13 @@ const BTN_RADIUS: u8 = 6;
 const CARD_RADIUS: u8 = 14;
 
 /// 最右工具列宽度（退出 X 与 刷新 图标各占其中一行，无边框/底色）。
-const EXIT_W: f32 = 30.0;
+const EXIT_W: f32 = 48.0;
 /// 工具列与按钮区之间留的空隙。
 const EXIT_GAP: f32 = 8.0;
 /// 单个指标列的最低宽度（防止按钮区过宽把指标区挤没了）。
 const METRIC_MIN_W: f32 = 78.0;
+/// 心电区固定宽（用户 2026-09-04 定稿：预估列后 ~70px）。画近 1 分钟的"每 5s 经验波动"。
+const WAVE_W: f32 = 70.0;
 
 /// 抽屉开着时窗口的最小宽度（避免卡片过窄时页面挤压）。
 const DRAWER_MIN_W: f32 = 320.0;
@@ -110,6 +113,8 @@ impl Action {
 pub struct BarData {
     pub exp_min: String,
     pub exp_hour: String,
+    /// 近 1 分钟逐 5s 净增 EXP（心电图数据源）。无样本时 None → 不画心电图。
+    pub spark: Option<[i64; SPARK_BUCKETS]>,
     pub punch: TimerUi,
     pub merchant: TimerUi,
     pub boss: TimerUi,
@@ -157,6 +162,8 @@ impl MxdBarApp {
                 } else {
                     "-".to_owned()
                 },
+                // 无样本（含启动/清空后）不画心电图。
+                spark: (g.exp.n_hour > 0).then_some(g.exp.spark),
                 punch: crate::util::punch_view(now, g.cfg.punch),
                 merchant: crate::util::merchant_view(now, g.cfg.merchant_time, g.cfg.merchant_ref),
                 boss: crate::util::boss_view(now, g.cfg.boss),
@@ -227,8 +234,9 @@ impl MxdBarApp {
         let btns_top = (BAR_HEIGHT - btns_h) * 0.5;
 
         // —— 指标列宽：由固定总宽 BAR_W 反推（宽度恒定，不随数值位数变）。
-        // 总宽 = 2*PAD_X + 2*col_w + 4*COL_GAP(两处分隔线槽) + btns_w + EXIT_GAP + EXIT_W。
-        let col_w = ((BAR_W - 2.0 * PAD_X - 4.0 * COL_GAP - btns_w - EXIT_GAP - EXIT_W) * 0.5)
+        // 总宽 = 2*PAD_X + 2*col_w + WAVE_W + 6*COL_GAP(三处分隔线槽) + btns_w + EXIT_GAP + EXIT_W。
+        let col_w = ((BAR_W - 2.0 * PAD_X - 6.0 * COL_GAP - WAVE_W - btns_w - EXIT_GAP - EXIT_W)
+            * 0.5)
             .max(METRIC_MIN_W)
             .floor();
 
@@ -241,13 +249,15 @@ impl MxdBarApp {
         let content_h = l1.y.max(l2.y) + VAL_GAP + v1.y.max(v2.y);
         let content_top = ((BAR_HEIGHT - content_h) * 0.5).max(4.0);
 
-        // —— 横向坐标：指标区 / 分隔线 / 指标区 / 分隔线 / 按钮区 / 工具列 ——
+        // —— 横向坐标：指标区 / 分隔线 / 指标区 / 分隔线 / 心电区 / 分隔线 / 按钮区 / 工具列 ——
         let x = bar.left() + PAD_X;
         let z1 = Rect::from_min_size(pos2(x, bar.top()), vec2(col_w, BAR_HEIGHT));
         let d1 = z1.right() + COL_GAP; // 分隔线1（居中于自己的间隙槽）
         let z2 = Rect::from_min_size(pos2(d1 + COL_GAP, bar.top()), vec2(col_w, BAR_HEIGHT));
         let d2 = z2.right() + COL_GAP; // 分隔线2
-        let btns_left = d2 + COL_GAP;
+        let wave_rect = Rect::from_min_size(pos2(d2 + COL_GAP, bar.top()), vec2(WAVE_W, BAR_HEIGHT));
+        let d3 = wave_rect.right() + COL_GAP; // 分隔线3（心电区 / 按钮区之间）
+        let btns_left = d3 + COL_GAP;
         let exit_left = btns_left + btns_w + EXIT_GAP;
         // 总宽固定（外框以 BAR_W 为准）。
         let total_w = BAR_W;
@@ -256,12 +266,18 @@ impl MxdBarApp {
         paint_metric(&painter, &z1, content_top, &l1, label_1, font_label.clone(), &v1, &data.exp_min, font_v1.clone(), pal.label, pal.exp_per_min);
         paint_metric(&painter, &z2, content_top, &l2, label_2, font_label.clone(), &v2, &data.exp_hour, font_v2.clone(), pal.label, pal.exp_per_hour);
 
+        // —— 心电区：近 1 分钟"每 5s 净增 EXP"相对该分钟均值的波动折线（无样本不画）——
+        if let Some(gains) = data.spark {
+            paint_wave(&painter, &wave_rect, &gains, &pal);
+        }
+
         // —— 分隔线 ——
         let div_top = bar.top() + 12.0;
         let div_bot = bar.bottom() - 12.0;
         let div_stroke = Stroke::new(1.0, pal.divider);
         painter.line_segment([pos2(d1, div_top), pos2(d1, div_bot)], div_stroke);
         painter.line_segment([pos2(d2, div_top), pos2(d2, div_bot)], div_stroke);
+        painter.line_segment([pos2(d3, div_top), pos2(d3, div_bot)], div_stroke);
 
         // —— 交互 ——
         // 先注册"整条拖动"（只主卡带可拖动，抽屉内容不抢）：按住空白处拖动窗口。
@@ -579,6 +595,49 @@ fn paint_metric(
         font_value,
         value_color,
     );
+}
+
+/// 画心电图折线：输入为近 1 分钟 12 个"每 5s 净增 EXP"。先减均值（0 落在中线），
+/// 再把最大偏离幅度贴到上下边界，因此匀速刷怪时是一条贴中线的平线，某个 5s 波动
+/// 明显（BOSS/爆发）就向上凸、不足时向下凹——只表达"相对该分钟的波动"，不带绝对量。
+/// `gains` 恒为固定 12 点；调用方在无样本时根本不给 Some，就不会画。
+fn paint_wave(painter: &egui::Painter, rect: &Rect, gains: &[i64; SPARK_BUCKETS], pal: &Palette) {
+    let n = gains.len();
+    let center = rect.center().y;
+    let half_amp = (rect.height() * 0.5 - 12.0).max(8.0);
+
+    // 该分钟均值（所有桶取平均，含尚未来得及填数据的更早桶）。
+    let mean = gains.iter().map(|&g| g as f64).sum::<f64>() / n as f64;
+    // 最大偏离幅度；全为 0/平坦时归 1，避免除零，此时整条线贴中线。
+    let maxd = gains
+        .iter()
+        .map(|&g| (g as f64 - mean).abs() as i64)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+
+    // 中线：0 = 窗口均值（淡一点，示意"波动以这条线为基准"）。
+    painter.line_segment(
+        [pos2(rect.left() + 2.0, center), pos2(rect.right() - 2.0, center)],
+        Stroke::new(1.0, pal.wave_axis),
+    );
+
+    let pad = 2.5;
+    let x0 = rect.left() + pad;
+    let x1 = rect.right() - pad;
+    let step_x = if n > 1 { (x1 - x0) / (n - 1) as f32 } else { 0.0 };
+    let pts: Vec<egui::Pos2> = gains
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| {
+            let dev = (g as f64 - mean) / maxd as f64; // ∈ [-1,1]
+            let y = center - (dev as f32) * half_amp; // 高于均值 → 上凸
+            pos2(x0 + i as f32 * step_x, y)
+        })
+        .collect();
+    if pts.len() >= 2 {
+        painter.add(egui::Shape::line(pts, Stroke::new(1.6, pal.wave)));
+    }
 }
 
 /// 画一个按钮，按悬停/按下状态变色；`emph` 决定是否用橘黄重点配色。

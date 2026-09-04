@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::state::{ExpMetrics, SamplerState, Shared};
+use crate::state::{ExpMetrics, SamplerState, Shared, SPARK_BUCKETS};
 
 use super::capture::{
     capture_window, find_game_hwnd, frame_is_blank, is_game_foreground, window_geo,
@@ -252,6 +252,7 @@ fn tick(
         n_hour,
         level: None,
         updated: Some(Instant::now()),
+        spark: spark_gains(recs, now),
     };
     g.sampler.state = SamplerState::Running;
     g.sampler.msg = match accept {
@@ -379,6 +380,55 @@ fn metrics(recs: &VecDeque<Sample>, now: Instant) -> (i64, i64, u32, u32) {
         }
         _ => (0, 0, 0, 0),
     }
+}
+
+/// 样本链 (at,exp) 在时刻 `t` 的 EXP 值：落在相邻两样本之间时做线性插值。
+/// 早于最老样本 / 晚于最新样本分别取两端值。样本为空返回 0。
+/// 心电图的 5s 桶可能落在"漏读造成的空隙"里，插值能把这段收益均匀摊到每个 5s 桶，
+/// 与整卡"用真实时间戳差分算速率"的口径一致（样本是逐段已知的折线，中间线性估计）。
+fn exp_at(recs: &VecDeque<Sample>, t: Instant) -> i64 {
+    let Some(first) = recs.front() else { return 0 };
+    if t <= first.at {
+        return first.exp;
+    }
+    let last = recs.back().unwrap();
+    if t >= last.at {
+        return last.exp;
+    }
+    let mut a = first;
+    for b in recs.iter().skip(1) {
+        if b.at >= t {
+            let dt = b.at.duration_since(a.at).as_secs_f64();
+            if dt <= 0.0 {
+                return a.exp;
+            }
+            let f = t.duration_since(a.at).as_secs_f64() / dt;
+            return (a.exp as f64 + (b.exp - a.exp) as f64 * f).round() as i64;
+        }
+        a = b;
+    }
+    last.exp
+}
+
+/// 主卡"心电图"数据：把最近 1 分钟（= 12×5s）切成 `SPARK_BUCKETS` 个 5s 桶，
+/// 每桶 = 该 5s 内净增的 EXP（最新在末尾）。样本不足 1 分钟时更早的桶为 0。
+/// 各桶都是非负的；UI 再相对这 1 分钟均值画"波动"折线。
+fn spark_gains(recs: &VecDeque<Sample>, now: Instant) -> [i64; SPARK_BUCKETS] {
+    let mut out = [0i64; SPARK_BUCKETS];
+    if recs.is_empty() {
+        return out;
+    }
+    let win = MIN_WINDOW; // 60s
+    let step = SAMPLE_INTERVAL; // 5s
+    let t0 = now
+        .checked_sub(win)
+        .unwrap_or_else(|| recs.front().map(|f| f.at).unwrap_or(now));
+    for (i, g) in out.iter_mut().enumerate() {
+        let l = t0 + step * i as u32;
+        let r = l + step;
+        *g = exp_at(recs, r).saturating_sub(exp_at(recs, l)).max(0);
+    }
+    out
 }
 
 /// 写入状态（不拿锁太久）。
@@ -747,5 +797,57 @@ mod tests {
         let (pm, ph, ..) = rates(&recs, base, 5 * 40);
         assert_eq!(pm, 6000, "合成截图像素流换算出的 实时EXP/分 应=6000/min");
         assert_eq!(ph, 360_000, "合成截图像素流换算出的 预估EXP/时 应=360,000/h");
+    }
+
+    // —— 心电图数据：近 1 分钟逐 5s 净增 EXP ——
+
+    /// 造一条严格递增的样本链：t=5s 起每 5s +500（100 EXP/s）。
+    fn steady_13(base: Instant) -> VecDeque<Sample> {
+        let mut recs = VecDeque::new();
+        for k in 1..=13 {
+            let t = 5 * k as u64;
+            recs.push_back(Sample { at: base + Duration::from_secs(t), exp: 500 * k as i64 });
+        }
+        recs
+    }
+
+    #[test]
+    fn spark_steady_60s_all_buckets_equal() {
+        let base = Instant::now();
+        let recs = steady_13(base); // 覆盖 5..=65s = 恰好 12 个 5s 桶
+        let s = spark_gains(&recs, base + Duration::from_secs(65));
+        assert_eq!(s.len(), SPARK_BUCKETS);
+        for (i, g) in s.iter().enumerate() {
+            assert_eq!(*g, 500, "第 {i} 个 5s 桶净增应=500");
+        }
+    }
+
+    #[test]
+    fn spark_splits_read_gap_evenly() {
+        let base = Instant::now();
+        // 抽掉 t=15s 那一条（漏读 10s：t=10 与 t=20 之间净增 +1000）。
+        // 插值应把这段收益均摊到 [10,15) 与 [15,20) 两个 5s 桶，各 +500，速率不偏。
+        let mut recs = VecDeque::new();
+        for t in [5u64, 10, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65] {
+            let exp = 500 * (t / 5) as i64; // t=20 → 2000（t=15 的 +500 已并入）
+            recs.push_back(Sample { at: base + Duration::from_secs(t), exp });
+        }
+        let s = spark_gains(&recs, base + Duration::from_secs(65));
+        assert_eq!(s, [500; SPARK_BUCKETS], "漏读间隙的收益应被均摊，每 5s 桶仍=500");
+    }
+
+    #[test]
+    fn spark_before_data_buckets_are_zero() {
+        let base = Instant::now();
+        // 最近才有数据：t=45..65s 共 5 条（+500/条），now=65s。
+        // 窗口 [5,65] 里 [5,45) 在首个样本之前 → 净增 0；[45,65) 才有 +500。
+        let mut recs = VecDeque::new();
+        for k in 9..=13 {
+            let t = 5 * k as u64;
+            recs.push_back(Sample { at: base + Duration::from_secs(t), exp: 500 * k as i64 });
+        }
+        let s = spark_gains(&recs, base + Duration::from_secs(65));
+        assert_eq!(&s[0..8], &[0; 8], "最早 8 个桶在首个样本前，应为 0");
+        assert_eq!(&s[8..], &[500; 4], "进入有数据区间后每桶=500");
     }
 }

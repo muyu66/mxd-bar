@@ -34,6 +34,9 @@ pub struct PickState {
     pub m: u32,
 }
 
+/// 主卡"心电图"的采样点数：近 1 分钟按 5s 分桶 = 12 点。
+pub(crate) const SPARK_BUCKETS: usize = 12;
+
 /// sampler 线程写给 UI 看的最新换算结果。
 #[derive(Debug, Clone, Default)]
 pub struct ExpMetrics {
@@ -52,6 +55,9 @@ pub struct ExpMetrics {
     /// 最近一次成功采样距当前有多久。预留：卡片"采样中/已过期"指示用。
     #[allow(dead_code)]
     pub updated: Option<std::time::Instant>,
+    /// 近 1 分钟逐 5s 净增 EXP（`SPARK_BUCKETS` 点，最新在末尾）——主卡"心电图"数据源。
+    /// 无样本 / 被清空时全 0；UI 在 `n_hour==0` 时隐藏整条心电图。
+    pub spark: [i64; SPARK_BUCKETS],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
