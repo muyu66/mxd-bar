@@ -31,7 +31,7 @@ pub fn page(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, kind: TimePickKind) 
         // —— 一整行就够：左边 HH : MM 输入，右边 确定/取消（确定在最右）——
         // 整行用 allocate_ui_with_layout 圈定单行高度(避免占满测量区)；再内嵌一个右对齐子区
         // 把两个按钮推到行尾。不放标题/提示/预览等文字。
-        ui.add_space(8.0);
+        // 页面上下留白统一由 app.rs 的 DRAWER_MARGIN_Y 给出，这里不再另加外圈空距。
         let row_h = 34.0;
         ui.allocate_ui_with_layout(
             vec2(ui.available_width(), row_h),
@@ -63,7 +63,6 @@ pub fn page(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, kind: TimePickKind) 
                 });
             },
         );
-        ui.add_space(8.0);
     }
 
     if confirm {

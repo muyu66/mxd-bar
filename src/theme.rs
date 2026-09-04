@@ -71,17 +71,17 @@ impl Palette {
             // 心电图：折线用淡绿，中线再淡一档（表达"0 = 这 1 分钟的均值"）。
             wave: Color32::from_rgb(120, 222, 172),
             wave_axis: Color32::from_rgba_unmultiplied(120, 222, 172, 70),
-            // 普通按钮 = 中性暗底；只有重点按钮（主卡"上报数据"、页面"确认/确定"）用橘黄
-            btn_bg: Color32::from_rgb(43, 52, 71),
-            btn_hover: Color32::from_rgb(58, 70, 94),
-            btn_active: Color32::from_rgb(78, 93, 122),
-            btn_border: Color32::from_rgb(84, 95, 120),
-            btn_text: Color32::from_rgb(240, 243, 248),
-            // 橘黄重点按钮
-            prim_bg: Color32::from_rgb(214, 122, 22),
-            prim_hover: Color32::from_rgb(244, 150, 48),
-            prim_active: Color32::from_rgb(255, 172, 74),
-            prim_border: Color32::from_rgba_unmultiplied(255, 176, 92, 140),
+            // 普通按钮 = 中性暗底（胶囊式）；只有重点按钮（主卡"上报数据"、页面"确认/确定"）用橘黄
+            btn_bg: Color32::from_rgb(46, 56, 76),
+            btn_hover: Color32::from_rgb(64, 77, 103),
+            btn_active: Color32::from_rgb(87, 103, 135),
+            btn_border: Color32::from_rgba_unmultiplied(160, 180, 220, 70),
+            btn_text: Color32::from_rgb(242, 245, 250),
+            // 橘黄重点按钮（常态略压一档，悬停抬到亮橘）
+            prim_bg: Color32::from_rgb(226, 126, 18),
+            prim_hover: Color32::from_rgb(255, 153, 51),
+            prim_active: Color32::from_rgb(255, 176, 84),
+            prim_border: Color32::from_rgba_unmultiplied(255, 180, 100, 140),
             success: SUCCESS,
             danger: DANGER,
         }

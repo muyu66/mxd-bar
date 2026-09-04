@@ -1,8 +1,10 @@
 //! 上报数据页（抽屉内）：表单页 ⇄ 成功页（同一块内容里切 `ReportPhase`）。
 //!
 //! 页面自身不做固定高度/滚动：整块内容自上而下自然排布，由 app.rs 量出实际高度
-//! 去适配窗口（"高度自适应"）。表单按"标签在上、输入在下"排成：
-//! 等级｜职业｜地图 / 攻击力或魔法力｜模式 / 备注(整行)。
+//! 去适配窗口（"高度自适应"）。表单排成固定两行：
+//! 第一行 = 等级｜职业｜地图｜攻击力(或魔法力)｜模式（除备注、按钮外的全部字段）；
+//! 第二行 = 备注 ＋ 取消/确认提交（按钮右对齐）。
+//! 地图联想列在地图栏正下方，点选即填入（仅输入中短暂出现，不常驻）。
 //! 只有「确认提交」是橘黄重点按钮；成功页里只有「前往查看」是橘黄重点按钮。
 //! 成功页没有图标：顶部是绿色分享网址，下方「返回 / 前往查看」两钮；
 //! 点网址或「前往查看」会开浏览器并**同时收起本页**。没有标题条与右上 ✕；
@@ -15,7 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use egui::{ComboBox, RichText, ScrollArea, Sense, TextEdit};
+use egui::{vec2, Align, ComboBox, Layout, RichText, ScrollArea, Sense, TextEdit};
 
 use crate::data::MAGIC_GROUP;
 use crate::net;
@@ -32,12 +34,12 @@ pub fn page(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let mut g = shared.lock().unwrap();
         let phase = g.report.phase;
 
-        ui.add_space(6.0);
+        // 页面上/下的统一留白由 app.rs 的 DRAWER_MARGIN_Y 给出，这里不再额外加外圈空距，
+        // 保证两页间距一致、内容不顶边。
         match phase {
             ReportPhase::Form => draw_form(ui, &mut g, &mut close, &mut kick),
             ReportPhase::Success => draw_success(ui, &mut g, &mut close, &mut open),
         }
-        ui.add_space(8.0); // 底部留白（窗口高度已按内容自动适配）
     } // 锁先放掉，再执行副作用
 
     if let Some(req) = kick {
@@ -56,69 +58,92 @@ pub fn page(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     }
 }
 
-/// 一个小节标签（标签在上、控件在下）。
-fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(6.0);
-    ui.label(RichText::new(text).strong());
-}
-
 // ---------------------------------------------------------------------------
 // 表单页
 // ---------------------------------------------------------------------------
 
 fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, kick: &mut Option<u64>) {
-    // —— 第 1 行：等级 | 职业 | 地图 ——
-    ui.columns(3, |cols| {
-        field_label(&mut cols[0], "等级");
-        cols[0].add(
-            TextEdit::singleline(&mut g.report.level)
-                .desired_width(f32::INFINITY)
-                .hint_text("正整数，如 120"),
-        );
+    let total = ui.available_width();
+    let gap = 8.0;
 
-        field_label(&mut cols[1], "职业");
-        job_combo(&mut cols[1], g);
+    // —— 第一行：除备注、按钮外的全部字段，一行内加权分栏 ——
+    // 权重：数字栏窄、职业中等、地图最宽、模式最小，让地图有搜索余地且整行一次排完。
+    let weights = [0.62f32, 1.0, 1.7, 1.0, 0.9];
+    let sum: f32 = weights.iter().sum();
+    let unit = ((total - gap * (weights.len() - 1) as f32) / sum).max(1.0);
+    let mut ws = [0.0f32; 5];
+    for (i, w) in weights.iter().enumerate() {
+        ws[i] = w * unit;
+    }
+    // "地图"列相对行首的 x（联想列表对齐用）。
+    let map_x = ws[0] + gap + ws[1] + gap;
 
-        map_field(&mut cols[2], g);
-    });
-
-    // —— 第 2 行：攻击力/魔法力 | 模式 ——
     let magic = g
         .jobs
         .get(g.report.job_group)
         .map_or(false, |gr| gr.group == MAGIC_GROUP);
-    ui.add_space(6.0);
-    ui.columns(2, |cols| {
-        field_label(&mut cols[0], if magic { "魔法力" } else { "攻击力" });
-        cols[0].add(
-            TextEdit::singleline(&mut g.report.power)
-                .desired_width(f32::INFINITY)
-                .hint_text("正整数"),
-        );
 
-        field_label(&mut cols[1], "模式");
-        mode_pick(&mut cols[1], g);
-    });
+    let _ = ui.allocate_ui_with_layout(
+        vec2(total, 200.0),
+        Layout::left_to_right(Align::Min),
+        |row| {
+            row.spacing_mut().item_spacing = vec2(gap, 0.0);
+            form_cell(row, ws[0], "等级", |c| {
+                c.add(
+                    TextEdit::singleline(&mut g.report.level)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("正整数"),
+                );
+            });
+            form_cell(row, ws[1], "职业", |c| job_combo(c, g));
+            form_cell(row, ws[2], "地图", |c| {
+                c.add(
+                    TextEdit::singleline(&mut g.report.map_query)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("搜索或直填"),
+                );
+            });
+            let label = if magic { "魔法力" } else { "攻击力" };
+            form_cell(row, ws[3], label, |c| {
+                c.add(
+                    TextEdit::singleline(&mut g.report.power)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("正整数"),
+                );
+            });
+            form_cell(row, ws[4], "模式", |c| mode_pick(c, g));
+        },
+    );
 
-    // —— 第 3 行：备注（整行）——
-    ui.add_space(6.0);
-    field_label(ui, "备注");
-    note_edit(ui, g);
+    // 地图联想：紧跟第一行、左对齐"地图"列；点选即填入（选中后联想自然消失，
+    // 平时不占位，保证整页稳定在两行）。
+    map_suggestions(ui, g, map_x);
 
+    // —— 第二行：备注（占左）+ 取消/确认提交（右对齐）——
     ui.add_space(12.0);
-    ui.separator();
-
-    // 错误提示
-    if !g.report.err.is_empty() {
-        ui.colored_label(theme::DANGER, &g.report.err);
-    }
-
-    // 确认（橘黄重点）/ 取消。提交中按钮显示"提交中…"并禁点（防重复）。
     let busy = g.report.submitting;
+    let confirm_w = 124.0;
+    let cancel_w = 88.0;
+    // 备注编辑宽 = 总宽 − "备注"标签 − 取消 − 确认 − 3 个横向自动间距。
+    let lab_w = ui
+        .painter()
+        .layout_no_wrap(
+            "备注".to_owned(),
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x;
+    let note_w = (total - lab_w - cancel_w - confirm_w - 3.0 * gap).max(120.0);
     ui.horizontal(|ui| {
+        ui.label(RichText::new("备注").weak());
+        note_edit(ui, g, note_w);
+        if ui.add_sized([cancel_w, 30.0], egui::Button::new("取消")).clicked() {
+            *close = true;
+        }
         let label = if busy { "提交中…" } else { "确认提交" };
         let resp = ui.add_sized(
-            [ui.available_width() * 0.6, 28.0],
+            [confirm_w, 30.0],
             egui::Button::new(RichText::new(label).strong()).fill(theme::ORANGE),
         );
         if busy {
@@ -136,13 +161,58 @@ fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, kick: &mut Opt
                 Err(e) => g.report.err = e,
             }
         }
-        ui.add_space(8.0);
-        if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new("取消"))
-            .clicked()
-        {
-            *close = true;
-        }
+    });
+
+    // 校验/提交出错时红字提示（仅在出错时出现的第三行）。
+    if !g.report.err.is_empty() {
+        ui.add_space(6.0);
+        ui.colored_label(theme::DANGER, &g.report.err);
+    }
+}
+
+/// 一个"标签在上、控件在下"的固定宽度栏。`w` 由外层分栏给定。
+fn form_cell(ui: &mut egui::Ui, w: f32, label: &str, ctl: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(vec2(w, 200.0), Layout::top_down(Align::Min), |c| {
+        c.spacing_mut().item_spacing = vec2(0.0, 5.0);
+        c.label(RichText::new(label).size(12.0).weak());
+        ctl(c);
+    });
+}
+
+/// 地图联想：对齐"地图"列的一小片候选列表，点选即填入；无查询或已精确匹配则不出现。
+fn map_suggestions(ui: &mut egui::Ui, g: &mut Shared, indent: f32) {
+    let q = g.report.map_query.trim().to_owned();
+    if q.is_empty() {
+        return;
+    }
+    let maps = Arc::clone(&g.maps);
+    let hits = crate::data::map_search(&maps, &q);
+    let exact = hits.iter().any(|m| m.name == q);
+    if hits.is_empty() || exact {
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        ui.add_space(indent);
+        let avail = ui.available_width();
+        let sw = avail.clamp(200.0, 360.0);
+        ScrollArea::vertical()
+            .id_salt("map_hits")
+            .max_height(150.0)
+            .min_scrolled_width(sw)
+            .show(ui, |ui| {
+                for m in hits.iter().take(10) {
+                    let name = m.name.clone();
+                    if ui
+                        .add_sized([sw, 24.0], egui::Button::new(name))
+                        .on_hover_text("点击填入")
+                        .clicked()
+                    {
+                        g.report.map_query = m.name.clone();
+                    }
+                }
+            });
     });
 }
 
@@ -232,39 +302,6 @@ fn job_combo(ui: &mut egui::Ui, g: &mut Shared) {
     g.report.job = ji;
 }
 
-/// 地图：输入 + 搜索二合一（选择建议列在下方，点选即填入）。
-fn map_field(ui: &mut egui::Ui, g: &mut Shared) {
-    field_label(ui, "地图");
-    ui.add(
-        TextEdit::singleline(&mut g.report.map_query)
-            .desired_width(f32::INFINITY)
-            .hint_text("输入关键字选择，或直接填地图名"),
-    );
-    let q = g.report.map_query.trim().to_owned();
-    if !q.is_empty() {
-        let maps_arc = Arc::clone(&g.maps);
-        let hits = crate::data::map_search(&maps_arc, &q);
-        let exact = hits.iter().any(|m| m.name == q);
-        if !hits.is_empty() && !exact {
-            ui.add_space(2.0);
-            ScrollArea::vertical()
-                .id_salt("map_hits")
-                .max_height(72.0)
-                .show(ui, |ui| {
-                    for m in hits.iter().take(12) {
-                        if ui
-                            .selectable_label(m.name == q, m.name.clone())
-                            .on_hover_text("点击填入")
-                            .clicked()
-                        {
-                            g.report.map_query = m.name.clone();
-                        }
-                    }
-                });
-        }
-    }
-}
-
 /// 模式：组队 / 单人。
 fn mode_pick(ui: &mut egui::Ui, g: &mut Shared) {
     ui.horizontal(|ui| {
@@ -277,15 +314,15 @@ fn mode_pick(ui: &mut egui::Ui, g: &mut Shared) {
     });
 }
 
-/// 备注：≤20 字符，输入途中超限立刻截断。
-fn note_edit(ui: &mut egui::Ui, g: &mut Shared) {
+/// 备注：≤20 字符，输入途中超限立刻截断。`width` = 编辑框宽度（第二行左区，占满到按钮前）。
+fn note_edit(ui: &mut egui::Ui, g: &mut Shared, width: f32) {
     let cap = g.report.note.chars().take(20).collect::<String>();
     if cap != g.report.note {
         g.report.note = cap;
     }
     let resp = ui.add(
         TextEdit::singleline(&mut g.report.note)
-            .desired_width(f32::INFINITY)
+            .desired_width(width)
             .hint_text("选填，最多 20 字"),
     );
     if resp.changed() {
@@ -383,7 +420,7 @@ fn draw_success(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, open: &mut 
     };
     let report_url = s.url.clone();
 
-    ui.add_space(18.0);
+    ui.add_space(2.0);
     // 绿色分享网址：点它 = 开浏览器看这条记录；开完顺手收起本页（等同"前往查看"）
     ui.vertical_centered(|ui| {
         let link = ui.add(
@@ -399,11 +436,14 @@ fn draw_success(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, open: &mut 
         }
     });
 
-    // 底部两按钮一行：返回(中性) / 前往查看(橘黄重点)。前往查看开完浏览器也收起本页。
-    ui.add_space(24.0);
+    // 底部两按钮一行：返回(中性) / 前往查看(橘黄重点)。定宽、居中，不铺满整行。
+    // 前往查看开完浏览器也收起本页。
+    ui.add_space(22.0);
+    let bw = 130.0;
+    let gap = 12.0;
+    let lead = ((ui.available_width() - (2.0 * bw + gap)) * 0.5).max(0.0);
     ui.horizontal(|ui| {
-        let gap = 8.0;
-        let bw = (ui.available_width() - gap) / 2.0;
+        ui.add_space(lead);
         if ui.add_sized([bw, 30.0], egui::Button::new("返回")).clicked() {
             *close = true;
         }
@@ -419,5 +459,4 @@ fn draw_success(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, open: &mut 
             *close = true;
         }
     });
-    ui.add_space(8.0);
 }

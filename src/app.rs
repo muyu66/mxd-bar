@@ -42,11 +42,10 @@ const COL_GAP: f32 = 9.0; // 分隔线两侧的间距
 const VAL_GAP: f32 = 3.0; // 指标区 标签→数值 间距
 const COLPAD: f32 = 6.0; // 指标区文字两侧留白
 
-const BTN_H: f32 = 22.0; // 按钮高
+const BTN_H: f32 = 26.0; // 按钮高（胶囊：圆角 = 半高）
 const BTN_ROW_GAP: f32 = 6.0; // 按钮行距
 const BTN_COL_GAP: f32 = 8.0; // 按钮列距
 const BTN_PAD_X: f32 = 14.0; // 每个按钮横向额外留白(两侧合计)
-const BTN_RADIUS: u8 = 6;
 
 const CARD_RADIUS: u8 = 14;
 
@@ -66,6 +65,12 @@ const PANEL_K: f32 = 14.0;
 /// 测量抽屉内容时给子 Ui 的最大高度：只要足够大让内容按自然高度排布即可，
 /// 真正的高度随后由"内容实际占用高度 + 上下留白"决定（被窗口裁剪也无妨）。
 const MEASURE_H: f32 = 3000.0;
+
+/// 抽屉页内容相对窗口左右的内边距（用户选"整幅通排但加大留白"：比主卡 PAD_X 更厚）。
+const DRAWER_PAD_X: f32 = 22.0;
+/// 抽屉内容相对主卡下沿 / 窗口底边的一致上下留白。各页面自身不再另加外圈空距，
+/// 上下留白都由这里统一给，保证两页观感一致、不再顶边缩角。
+const DRAWER_MARGIN_Y: f32 = 14.0;
 
 /// 主卡片上的按钮动作。退出 X 与 刷新 不在按钮行里，单独画在最右的工具列（上/下各一行）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,9 +440,10 @@ impl eframe::App for MxdBarApp {
         // 窗口暂不够高时看不见的部分下一帧随面板长出来即可。量到的 min_rect 高度即内容高。
         let mut used_h = 0.0f32;
         if open {
-            let col_x = win.left() + PAD_X;
-            let col_w = (win.width() - 2.0 * PAD_X).max(0.0);
-            let start_y = win.top() + BAR_HEIGHT;
+            // 抽屉整幅通排但加大对称留白：左右 DRAWER_PAD_X、上下 DRAWER_MARGIN_Y 各一致。
+            let col_x = win.left() + DRAWER_PAD_X;
+            let col_w = (win.width() - 2.0 * DRAWER_PAD_X).max(0.0);
+            let start_y = win.top() + BAR_HEIGHT + DRAWER_MARGIN_Y;
             let shared = Arc::clone(&self.shared);
             let _ = ui.scope_builder(
                 UiBuilder::new()
@@ -463,9 +469,13 @@ impl eframe::App for MxdBarApp {
             );
         }
 
-        // —— 面板高度目标：页面上沿到内容底(used_h) + 顶部/底部呼吸留白 ——
-        // 页面上沿在 BAR_HEIGHT，故额外高度 ≈ used_h + 上下留白。
-        let target_h = if open { (used_h + 14.0).max(0.0) } else { 0.0 };
+        // —— 面板高度目标：页面上沿在 BAR_HEIGHT + DRAWER_MARGIN_Y（顶留白），
+        // 窗口还需 used_h 加上对称的底留白 DRAWER_MARGIN_Y。总 = used_h + 2 * DRAWER_MARGIN_Y。
+        let target_h = if open {
+            (used_h + 2.0 * DRAWER_MARGIN_Y).max(0.0)
+        } else {
+            0.0
+        };
 
         // —— 抽屉高度动画：指数趋近目标 ——
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
@@ -693,8 +703,22 @@ fn paint_button(
     };
     let rect = rect.translate(vec2(dx, 0.0));
 
-    painter.rect_filled(rect, BTN_RADIUS, fill);
-    painter.rect_stroke(rect, BTN_RADIUS, Stroke::new(1.0, border), StrokeKind::Inside);
+    // 胶囊：圆角 = 半高，两端成圆弧。常态再叠一条贴顶的淡高光，呈轻微"凸起"。
+    let radius = (rect.height() * 0.5).max(4.0);
+    painter.rect_filled(rect, radius, fill);
+    painter.rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
+    if !resp.is_pointer_button_down_on() {
+        // 顶部淡高光（白色 ~7%），只在圆弧之间的平直段，避免戳出弧外。
+        let gloss = Color32::from_rgba_unmultiplied(255, 255, 255, 18);
+        let inner = rect.shrink(1.0);
+        painter.line_segment(
+            [
+                pos2(inner.left() + radius * 0.6, inner.top() + 1.0),
+                pos2(inner.right() - radius * 0.6, inner.top() + 1.0),
+            ],
+            Stroke::new(1.0, gloss),
+        );
+    }
     painter.text(
         pos2(rect.center().x - text_size.x * 0.5, rect.center().y - text_size.y * 0.5),
         Align2::LEFT_TOP,
