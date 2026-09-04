@@ -72,6 +72,53 @@ fn main() -> eframe::Result {
 
     let shared = Arc::new(Mutex::new(Shared::new(cfg, jobs, maps)));
 
+    // debug：联调自测 `--nettest`——对本地服务跑一遍 换 token + 上报。
+    // 只允许走本地地址（data.ini [net] base=local），避免误往生产库塞假数据。
+    #[cfg(debug_assertions)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--nettest") {
+            let cfg = shared.lock().unwrap().cfg.clone();
+            let base = crate::net::api_base(&cfg);
+            eprintln!("[nettest] base={base}");
+            if !crate::net::local_enabled(&cfg) {
+                eprintln!("[nettest] 只限本地联调：请设环境变量 MXD_BAR_API=local，或在 data.ini 写 [net] base=local");
+                return Ok(());
+            }
+            let uid = shared
+                .lock()
+                .unwrap()
+                .uid
+                .clone()
+                .or_else(crate::net::compute_uid)
+                .unwrap_or_default();
+            eprintln!("[nettest] uid={uid}");
+            if uid.is_empty() {
+                eprintln!("[nettest] 无法取得设备标识(主板序列号)，中止");
+            } else {
+                match crate::net::request_token(base, &uid) {
+                    Ok((tok, exp)) => {
+                        eprintln!("[nettest] token OK (len={}, {}s)", tok.len(), exp);
+                        let p = serde_json::json!({
+                            "exp_per_hour": 0, "job": "测试", "level": 1,
+                            "map": "测试地图", "mode": "solo", "power": 1,
+                            "note": "mxd-bar --nettest", "test_seconds": 5,
+                        });
+                        match crate::net::post_report(base, &tok, &p) {
+                            Ok(id) => eprintln!(
+                                "[nettest] report OK id={id} 分享={}",
+                                crate::net::share_url(base, &id)
+                            ),
+                            Err(e) => eprintln!("[nettest] report 失败: {e:?}"),
+                        }
+                    }
+                    Err(e) => eprintln!("[nettest] token 失败: {e}"),
+                }
+            }
+            return Ok(());
+        }
+    }
+
     // debug：启动即展开某个抽屉页，便于离线观察/自测布局（`--page-report` / `--page-pick`）。
     #[cfg(debug_assertions)]
     {
@@ -97,10 +144,11 @@ fn main() -> eframe::Result {
     }
 
 
-    // —— 采样线程：整窗截图 + 内嵌模板分类器读全量 EXP，每 5s 按真实时间戳算经验速率 ——
-    // 不取等级/百分比/条宽，只差分 EXP 整数；读失败不记录；单次读数递减当作瞬时误读忽略、
-    // 连续 3 条低于此前平均才判定升级并重置（细节见 sampler.rs）。游戏没开时线程自己停在
-    // "未检测到游戏"状态，不影响卡片。
+    // —— 采样线程：仅当 Maplestory_Classic.exe 位于前台时才整窗截图 + OCR 读全量 EXP ——
+    // 每 5s 按"活动时钟"（扣除切走/最小化等暂停墙钟）算经验速率；切走即暂停、回来续走，暂停
+    // 的空隙不会把速率拉低。不取等级/百分比/条宽，只差分 EXP 整数；读失败不记录；单次读数递减
+    // 当作瞬时误读忽略、连续 3 条低于此前平均才判定升级并重置（细节见 sampler.rs）。
+    // 游戏没开或不在前台时线程停在对应状态，不影响卡片。
     let stop = Arc::new(AtomicBool::new(false));
     let sampler_handle = {
         let shared2 = Arc::clone(&shared);
@@ -108,9 +156,8 @@ fn main() -> eframe::Result {
         std::thread::spawn(move || sensor::sampler::run(shared2, st))
     };
 
-    // —— UID（主板序列号 → MD5 32hex）——
-    // 未命中缓存时后台算一次并写进 data.ini；期间 UI 照常可用，
-    // "管理数据" 点击时 uid 还是 None 也只差一个空参数，等它算完即可。
+    // —— UID（主板序列号 → MD5 32hex）——它是 v2 换 token 用的 deviceId。
+    // 未命中缓存时后台算一次并写进 data.ini；token_keeper 会等它到位后再换 token。
     {
         let need = shared.lock().unwrap().uid.is_none();
         if need {
@@ -128,6 +175,9 @@ fn main() -> eframe::Result {
             });
         }
     }
+
+    // —— v2 token 预取与刷新：后台线程维护 JWT（等 uid 算好后再换），UI 不碰联网 ——
+    crate::net::spawn_token_keeper(Arc::clone(&shared));
 
     let result = eframe::run_native(
         "mxd-bar",

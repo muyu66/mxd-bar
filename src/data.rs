@@ -5,7 +5,11 @@
 //!
 //! 曾经还用过 exp-table.json（各等级所需经验）：自采样改读全量整数 EXP 差分后不再需要等级表，
 //! 已连同整条 exp-table 读取代码一起删除（见仓库清理记录）。
+//!
+//! **数据已内嵌**：两份表在编译时以 include_bytes 烤进 exe（release 单文件分发不必带 data/）；
+//! 运行时仍优先读 exe 旁的 `data/<name>` 文件（便于不改代码就热更数据），找不到再退回内嵌那份。
 
+use std::borrow::Cow;
 use std::io;
 
 use serde::Deserialize;
@@ -14,6 +18,10 @@ use crate::config::find_data_file;
 
 /// 魔法师系 = group 精确等于该值（牧师等职业名里不含"法师"，不能靠名字猜）。
 pub const MAGIC_GROUP: &str = "魔法师系";
+
+/// 编译期内嵌的 data 表字节（release 单 exe 时的后备数据源）。
+const JOBS_JSON: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/jobs.json"));
+const MAPS_JSON: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/maps.json"));
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobGroup {
@@ -39,30 +47,26 @@ pub struct MapInfo {
     pub street: Option<String>,
 }
 
-/// 读取整个 data 文件并解析成 T。找不到文件或 JSON 非法都返回带路径的错误信息。
-fn load_json<T: for<'de> Deserialize<'de>>(name: &str) -> io::Result<T> {
-    let path = find_data_file(name).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("找不到数据文件 {name}（data/ 目录应放在 exe 或当前目录旁）"),
-        )
-    })?;
-    let bytes = std::fs::read(&path)?;
-    let v = serde_json::from_slice(&bytes).map_err(|e| {
+/// 解析一份 data JSON：先读 exe 旁的磁盘文件（可覆盖/热更），找不到就用内嵌字节。
+fn load_json<T: for<'de> Deserialize<'de>>(name: &str, embedded: &[u8]) -> io::Result<T> {
+    let bytes: Cow<'_, [u8]> = match find_data_file(name) {
+        Some(path) => std::fs::read(&path)?.into(),
+        None => embedded.into(), // data/ 没放旁边 → 退回烤进 exe 的那份
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{name} JSON 解析失败: {e}"),
         )
-    })?;
-    Ok(v)
+    })
 }
 
 pub fn load_jobs() -> io::Result<Vec<JobGroup>> {
-    load_json("jobs.json")
+    load_json("jobs.json", JOBS_JSON)
 }
 
 pub fn load_maps() -> io::Result<Vec<MapInfo>> {
-    load_json("maps.json")
+    load_json("maps.json", MAPS_JSON)
 }
 
 /// 找某个职业在 groups 中的位置 `(组下标, 组内下标)`。
@@ -128,5 +132,15 @@ mod tests {
         // 空查询 → 空结果；不存在的字 → 空结果
         assert!(map_search(&hunting, "").is_empty());
         assert!(map_search(&hunting, "不存在的图").is_empty());
+    }
+
+    #[test]
+    fn embedded_fallback_parses() {
+        // release 单 exe 不带 data/ 时读的是内嵌字节；这里直接验证烤进 exe 的两份表可解析、
+        // 且与磁盘版口径一致（5 职业组 / 237 张打怪图）。
+        let groups: Vec<JobGroup> = serde_json::from_slice(JOBS_JSON).expect("内嵌 jobs.json 应可解析");
+        let all: Vec<MapInfo> = serde_json::from_slice(MAPS_JSON).expect("内嵌 maps.json 应可解析");
+        assert_eq!(groups.len(), 5);
+        assert_eq!(filter_hunting(&all).len(), 237);
     }
 }

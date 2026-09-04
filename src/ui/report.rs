@@ -1,11 +1,16 @@
 //! 上报数据页（抽屉内）：表单页 ⇄ 成功页（同一块内容里切 `ReportPhase`）。
 //!
 //! 页面自身不做固定高度/滚动：整块内容自上而下自然排布，由 app.rs 量出实际高度
-//! 去适配窗口（“高度自适应”）。表单按“标签在上、输入在下”排成：
+//! 去适配窗口（"高度自适应"）。表单按"标签在上、输入在下"排成：
 //! 等级｜职业｜地图 / 攻击力或魔法力｜模式 / 备注(整行)。
 //! 只有「确认提交」是橘黄重点按钮；成功页里只有「前往查看」是橘黄重点按钮。
-//! 没有标题条与右上 ✕；收起 = 再点主卡按钮、或“取消”/“返回”。
+//! 成功页没有图标：顶部是绿色分享网址，下方「返回 / 前往查看」两钮；
+//! 点网址或「前往查看」会开浏览器并**同时收起本页**。没有标题条与右上 ✕；
+//! 收起 = 再点主卡按钮、或"取消"/"返回"（以及上面的"前往查看/点网址"）。
 //! 布局与行为见根目录 `开发.md`。
+//!
+//! 确认提交后把载荷交给**后台线程**真正联网（v2 上报），期间按钮显示"提交中…"并防重；
+//! 成功 → 切到成功页并展示分享网址；失败 → 留在表单、红字给原因，可直接改后重试。
 
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +19,7 @@ use egui::{ComboBox, RichText, ScrollArea, Sense, TextEdit};
 
 use crate::data::MAGIC_GROUP;
 use crate::net;
-use crate::state::{Page, ReportPhase, Shared};
+use crate::state::{Page, ReportPayload, ReportPhase, ReportSuccess, Shared};
 use crate::theme;
 
 /// 在抽屉区里画整页内容（表单或成功页），由 app.rs 在 `shared.page==Report` 时调用。
@@ -22,18 +27,22 @@ use crate::theme;
 pub fn page(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let mut close = false;
     let mut open: Option<String> = None; // 点外部链接 / 管理数据 → 打开浏览器
+    let mut kick: Option<u64> = None; // 确认提交通过校验，要去后台联网（记下 req）
     {
         let mut g = shared.lock().unwrap();
         let phase = g.report.phase;
 
         ui.add_space(6.0);
         match phase {
-            ReportPhase::Form => draw_form(ui, &mut g, &mut close),
+            ReportPhase::Form => draw_form(ui, &mut g, &mut close, &mut kick),
             ReportPhase::Success => draw_success(ui, &mut g, &mut close, &mut open),
         }
         ui.add_space(8.0); // 底部留白（窗口高度已按内容自动适配）
     } // 锁先放掉，再执行副作用
 
+    if let Some(req) = kick {
+        start_submit(Arc::clone(shared), req); // 联网放后台，UI 不卡
+    }
     if let Some(url) = open {
         net::open_url(&url);
     }
@@ -47,7 +56,7 @@ pub fn page(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     }
 }
 
-/// 一个小节的标签（标签在上、控件在下）。
+/// 一个小节标签（标签在上、控件在下）。
 fn field_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
     ui.label(RichText::new(text).strong());
@@ -57,7 +66,7 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 // 表单页
 // ---------------------------------------------------------------------------
 
-fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool) {
+fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, kick: &mut Option<u64>) {
     // —— 第 1 行：等级 | 职业 | 地图 ——
     ui.columns(3, |cols| {
         field_label(&mut cols[0], "等级");
@@ -104,16 +113,28 @@ fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool) {
         ui.colored_label(theme::DANGER, &g.report.err);
     }
 
-    // 确认（橘黄重点）/ 取消
+    // 确认（橘黄重点）/ 取消。提交中按钮显示"提交中…"并禁点（防重复）。
+    let busy = g.report.submitting;
     ui.horizontal(|ui| {
-        if ui
-            .add_sized(
-                [ui.available_width() * 0.6, 28.0],
-                egui::Button::new(RichText::new("确认提交").strong()).fill(theme::ORANGE),
-            )
-            .clicked()
-        {
-            submit(g); // 成功时内部已切到成功页并落盘
+        let label = if busy { "提交中…" } else { "确认提交" };
+        let resp = ui.add_sized(
+            [ui.available_width() * 0.6, 28.0],
+            egui::Button::new(RichText::new(label).strong()).fill(theme::ORANGE),
+        );
+        if busy {
+            resp.on_hover_text("正在联网上报，请稍候");
+        } else if resp.clicked() {
+            match build_payload(g) {
+                Ok(payload) => {
+                    g.report.err.clear();
+                    g.report.submitting = true;
+                    g.report.req = g.report.req.wrapping_add(1);
+                    let req = g.report.req;
+                    g.report.pending = Some(payload);
+                    *kick = Some(req);
+                }
+                Err(e) => g.report.err = e,
+            }
         }
         ui.add_space(8.0);
         if ui
@@ -123,6 +144,60 @@ fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool) {
             *close = true;
         }
     });
+}
+
+/// 校验 + 保存默认值 + 打包本次上报载荷。出错时返回消息（调用方写进 `report.err`）。
+/// 只在"进页面那一刻冻结的 exp 快照"上打包，见 state.rs `init_report`。
+fn build_payload(g: &mut Shared) -> Result<ReportPayload, String> {
+    let level: u32 = match g.report.level.trim().parse() {
+        Ok(v) if v >= 1 => v,
+        _ => return Err("等级需为 ≥1 的正整数".into()),
+    };
+
+    let job = g.job_name(g.report.job_group, g.report.job);
+    if job.is_empty() {
+        return Err("请选择一个职业（data/jobs.json 缺失？）".into());
+    }
+
+    let map = g.report.map_query.trim();
+    if map.is_empty() {
+        return Err("请填写或选择一个地图".into());
+    }
+
+    let power: u64 = match g.report.power.trim().parse() {
+        Ok(v) if v >= 1 => v,
+        _ => {
+            let label = if g
+                .jobs
+                .get(g.report.job_group)
+                .map_or(false, |gr| gr.group == MAGIC_GROUP)
+            {
+                "魔法力"
+            } else {
+                "攻击力"
+            };
+            return Err(format!("{label} 需为 ≥1 的正整数"));
+        }
+    };
+
+    // 保存默认值到 data.ini（下次打开自动带出）
+    g.cfg.level = level;
+    g.cfg.job = job.clone();
+    g.cfg.map = map.to_owned();
+    g.cfg.mode_solo = g.report.mode_solo;
+    g.cfg.power = power;
+    g.persist_cfg();
+
+    Ok(ReportPayload {
+        level,
+        job,
+        map: map.to_owned(),
+        mode_solo: g.report.mode_solo,
+        power,
+        note: g.report.note.clone(),
+        exp_per_hour: g.report.exp_per_hour,
+        exp_seconds: g.report.exp_seconds,
+    })
 }
 
 /// 职业：ComboBox，组内做小标题分组。
@@ -222,78 +297,79 @@ fn note_edit(ui: &mut egui::Ui, g: &mut Shared) {
     }
 }
 
-/// 校验 + 保存默认值 + 切到成功页。出错时把消息写进 `report.err` 并返回 false。
-fn submit(g: &mut Shared) -> bool {
-    g.report.err.clear();
+// ---------------------------------------------------------------------------
+// 联网提交（后台线程）
+// ---------------------------------------------------------------------------
 
-    let level: u32 = match g.report.level.trim().parse() {
-        Ok(v) if v >= 1 => v,
-        _ => {
-            g.report.err = "等级需为 ≥1 的正整数".into();
-            return false;
+/// v2 上报请求体：snake_case，每小时值直接给，服务端以 token 的 sub 落设备。
+fn report_json(p: &ReportPayload) -> serde_json::Value {
+    serde_json::json!({
+        "exp_per_hour": p.exp_per_hour,
+        "job": p.job,
+        "level": p.level,
+        "map": p.map,
+        "mode": if p.mode_solo { "solo" } else { "party" },
+        "power": p.power,
+        "note": p.note,
+        "test_seconds": p.exp_seconds,
+    })
+}
+
+/// 上报流程：换/取 token → POST。遇 401（token 失效）强制换新重试一次。
+fn send_report(shared: &Arc<Mutex<Shared>>, base: &str, payload: &ReportPayload) -> Result<String, net::ApiError> {
+    let to_api = |e: String| net::ApiError { status: None, message: e };
+    let json = report_json(payload);
+    let token = net::ensure_device_token(shared).map_err(to_api)?;
+    match net::post_report(base, &token, &json) {
+        Ok(id) => Ok(id),
+        Err(ae) if ae.status == Some(401) => {
+            // 缓存里的 token 被拒：清掉换新的再试一次
+            let token2 = net::refresh_token(shared).map_err(to_api)?;
+            net::post_report(base, &token2, &json)
         }
-    };
-
-    let job = g.job_name(g.report.job_group, g.report.job);
-    if job.is_empty() {
-        g.report.err = "请选择一个职业（data/jobs.json 缺失？）".into();
-        return false;
+        Err(ae) => Err(ae),
     }
+}
 
-    let map = g.report.map_query.trim();
-    if map.is_empty() {
-        g.report.err = "请填写或选择一个地图".into();
-        return false;
-    }
-
-    let power: u64 = match g.report.power.trim().parse() {
-        Ok(v) if v >= 1 => v,
-        _ => {
-            let label = if g
-                .jobs
-                .get(g.report.job_group)
-                .map_or(false, |gr| gr.group == MAGIC_GROUP)
-            {
-                "魔法力"
+/// 起一个后台线程做真正联网。成功后写 success/切成功页；失败留在表单红字原因。
+/// 回写前比对 `req`，若用户已重新打开/切换页面则旧结果作废（不覆盖新会话）。
+fn start_submit(shared: Arc<Mutex<Shared>>, req: u64) {
+    std::thread::spawn(move || {
+        let (base, payload) = {
+            let g = shared.lock().unwrap();
+            if g.report.submitting && g.report.req == req {
+                let base = net::api_base(&g.cfg);
+                (base.to_owned(), g.report.pending.clone())
             } else {
-                "攻击力"
-            };
-            g.report.err = format!("{label} 需为 ≥1 的正整数");
-            return false;
+                (String::new(), None)
+            }
+        };
+        let Some(payload) = payload else { return };
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[mxd-bar] 上报 {} → {base}",
+            report_json(&payload)
+        );
+
+        let result = send_report(&shared, &base, &payload);
+
+        let mut g = shared.lock().unwrap();
+        if !(g.report.submitting && g.report.req == req) {
+            return; // 页面已被重新打开/切换，别拿旧结果覆盖
         }
-    };
-
-    // 保存默认值到 data.ini（下次打开自动带出）
-    g.cfg.level = level;
-    g.cfg.job = job.clone(); // 原值保留给下方 payload 用
-    g.cfg.map = map.to_owned();
-    g.cfg.mode_solo = g.report.mode_solo;
-    g.cfg.power = power;
-    g.persist_cfg();
-
-    // 整理上报 JSON（远程接口暂不实现）。release 不联网，仅 debug 打印预览，
-    // 故拼装整体只在 debug 构建里做；日后接真实远程接口时把这段挪出 cfg 即可。
-    #[cfg(debug_assertions)]
-    {
-        let payload = serde_json::json!({
-            "level": level,
-            "job": job,
-            "map": map,
-            "mode": if g.report.mode_solo { "solo" } else { "party" },
-            "power": power,
-            "note": g.report.note,
-            "exp_per_hour": g.exp.per_hour,
-            "test_seconds": g.exp.n_hour as i64 * 5,
-        });
-        eprintln!("[mxd-bar] 上报 payload: {payload}");
-    }
-
-    // 跳转成功页（远程返回值暂以本地占位网址代替）
-    g.report.success = Some(crate::state::ReportSuccess {
-        url: net::report_view_url(),
+        match result {
+            Ok(id) => {
+                g.report.success = Some(ReportSuccess { url: net::share_url(&base, &id) });
+                g.report.submitting = false;
+                g.report.phase = ReportPhase::Success;
+            }
+            Err(ae) => {
+                g.report.err = format!("上报失败：{}", ae.message);
+                g.report.submitting = false;
+            }
+        }
     });
-    g.report.phase = ReportPhase::Success;
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -307,29 +383,27 @@ fn draw_success(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, open: &mut 
     };
     let report_url = s.url.clone();
 
-    ui.add_space(16.0);
+    ui.add_space(18.0);
+    // 绿色分享网址：点它 = 开浏览器看这条记录；开完顺手收起本页（等同"前往查看"）
     ui.vertical_centered(|ui| {
-        // 绿色对勾图标（替代"上报成功！"文字）
-        ui.label(RichText::new("✓").color(theme::SUCCESS).strong().size(42.0));
-        ui.add_space(6.0);
-        // 绿色网址（占位），点击等同"前往查看"
         let link = ui.add(
             egui::Label::new(RichText::new(&report_url).color(theme::SUCCESS).underline())
                 .sense(Sense::click()),
         );
         if link.clicked() {
             *open = Some(report_url.clone());
+            *close = true;
         }
         if link.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     });
 
-    // 底部三个按钮一行：返回(中性) / 前往查看(橘黄重点) / 管理数据(中性)
+    // 底部两按钮一行：返回(中性) / 前往查看(橘黄重点)。前往查看开完浏览器也收起本页。
     ui.add_space(24.0);
     ui.horizontal(|ui| {
         let gap = 8.0;
-        let bw = (ui.available_width() - gap * 2.0) / 3.0;
+        let bw = (ui.available_width() - gap) / 2.0;
         if ui.add_sized([bw, 30.0], egui::Button::new("返回")).clicked() {
             *close = true;
         }
@@ -342,14 +416,7 @@ fn draw_success(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, open: &mut 
             .clicked()
         {
             *open = Some(report_url.clone());
-        }
-        ui.add_space(gap);
-        let manage_url = net::manage_url(g.uid.as_deref().unwrap_or(""));
-        if ui
-            .add_sized([bw, 30.0], egui::Button::new("管理数据"))
-            .clicked()
-        {
-            *open = Some(manage_url);
+            *close = true;
         }
     });
     ui.add_space(8.0);

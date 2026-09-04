@@ -4,6 +4,7 @@
 //! 全部可变状态集中在这里，用 `Arc<Mutex<Shared>>` 传递，避免跨线程（sampler）抢锁。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::config::AppConfig;
 use crate::data::{JobGroup, MapInfo};
@@ -59,6 +60,9 @@ pub enum SamplerState {
     Init,
     Running,
     NoGame,
+    /// 游戏在运行但窗口不在前台（被切走/最小化/点了悬浮卡）：暂停截图与经验计时。
+    /// 与 NoGame 不同：这是"暂停"而非"失败"，已算出的数值保持冻结、不清成 `-`。
+    Paused,
     OcrFailed,
 }
 
@@ -83,8 +87,24 @@ impl Default for ReportPhase {
 /// 确认提交后跳到成功页要展示的内容。
 #[derive(Debug, Clone, Default)]
 pub struct ReportSuccess {
-    /// 绿色网址（远程返回的占位）。
+    /// 分享网址：`<base>/exp.html?id=<服务端返回的 id>`（点开只显示这一条记录）。
     pub url: String,
+}
+
+/// 一次"确认提交"打包好的整份上报载荷（在 UI 校验通过那一刻冻结，
+/// 交给后台线程真正联网；open 后再改表单不影响这次提交）。
+#[derive(Debug, Clone)]
+pub struct ReportPayload {
+    pub level: u32,
+    pub job: String,
+    pub map: String,
+    pub mode_solo: bool,
+    pub power: u64,
+    pub note: String,
+    /// 打开上报页那一刻缓存的 预估EXP/时。
+    pub exp_per_hour: i64,
+    /// 对应的"实测刷怪秒数"（窗内采样条数 × 5s）。
+    pub exp_seconds: i64,
 }
 
 /// 上报表单的编辑态。egui 文本编辑只能经共享态缓冲，故全用字符串/索引。
@@ -108,6 +128,16 @@ pub struct ReportState {
     pub err: String,
     /// 成功页内容（phase==Success 时有值）。
     pub success: Option<ReportSuccess>,
+    /// 正在提交（联网中）：置灰「确认提交」并显示"提交中…"，防重复点。
+    pub submitting: bool,
+    /// 打开上报页那一刻缓存的 预估EXP/时 与 实测秒数（提交载荷的一部分）。
+    pub exp_per_hour: i64,
+    pub exp_seconds: i64,
+    /// 递增序号：每次打开页面或发起提交 +1。后台线程提交完成回写前比对它，
+    /// 不符说明页面已被重新打开/切换，旧结果不再写入（防止覆盖新会话状态）。
+    pub req: u64,
+    /// 校验通过、待联网提交的载荷（submitting=true 时有值）。
+    pub pending: Option<ReportPayload>,
 }
 
 /// 全部共享状态。
@@ -123,6 +153,12 @@ pub struct Shared {
     // —— net 后台算完回填 ——
     pub uid: Option<String>,
     pub uid_error: Option<String>,
+    /// v2 JWT（POST /api/v2/exp/token 换来，2h 有效）。token_keeper 线程维护。
+    pub token: Option<String>,
+    /// token 过期时刻。
+    pub token_exp: Option<Instant>,
+    /// 最近一次换 token 失败的原因（供 UI/调试提示，暂无展示位）。
+    pub token_error: Option<String>,
     // —— 只读数据表 ——
     pub jobs: Arc<Vec<JobGroup>>,
     /// 只含 `scene=="hunting"` 的地图。
@@ -141,6 +177,9 @@ impl Shared {
             pick: PickState::default(),
             uid: cfg.uid_cache.clone(),
             uid_error: None,
+            token: None,
+            token_exp: None,
+            token_error: None,
             jobs: Arc::new(jobs),
             maps: Arc::new(maps),
             cfg,
@@ -168,6 +207,9 @@ impl Shared {
             crate::data::find_job(&self.jobs, &job).unwrap_or(first)
         };
 
+        // 打开上报页那一刻冻结"预估EXP/时"与其实测秒数：填表期间即使采样继续，
+        // 提交的仍是进页面这一刻的值（否则填了十分钟再提交，rate 会被这十分钟稀释）。
+        let secs = self.exp.n_hour as i64 * crate::sensor::sampler::SAMPLE_INTERVAL_SECS as i64;
         self.report = ReportState {
             phase: ReportPhase::Form,
             level: (level > 0).then(|| level.to_string()).unwrap_or_default(),
@@ -179,6 +221,11 @@ impl Shared {
             note: String::new(),
             err: String::new(),
             success: None,
+            submitting: false,
+            exp_per_hour: self.exp.per_hour,
+            exp_seconds: secs,
+            req: self.report.req.wrapping_add(1),
+            pending: None,
         };
     }
 

@@ -15,8 +15,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, IsIconic,
-    PW_RENDERFULLCONTENT,
+    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+    IsIconic, PW_RENDERFULLCONTENT,
 };
 
 /// 一帧 top-down BGRA 图（每像素 4 字节，行与行间无填充）。
@@ -82,6 +82,27 @@ pub fn find_game_hwnd() -> Option<HWND> {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut FindCtx as isize));
     }
     ctx.hwnd
+}
+
+/// 前台(当前被聚焦)的顶层窗口是否属于游戏进程。
+/// 只有游戏真的位于前台才允许截图/OCR；切到别的窗口、点了悬浮卡、窗口最小化/锁屏都算不在前台。
+fn pid_of(h: HWND) -> Option<u32> {
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    (pid != 0).then_some(pid)
+}
+
+/// 前台窗口是否属于游戏进程（比 HWND 严格相等更稳：游戏若有多个窗口，聚焦任意一个都算）。
+pub fn is_game_foreground(hwnd: HWND) -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false; // 没有前台窗口（锁屏等）
+        }
+        let a = pid_of(hwnd);
+        let b = pid_of(fg);
+        a.is_some() && a == b
+    }
 }
 
 /// 整窗截图。返回 None = 窗口无效/太小/无法分配 DIB。

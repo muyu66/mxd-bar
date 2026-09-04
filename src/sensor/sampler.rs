@@ -19,6 +19,11 @@
 //!   用真实时间戳而不是"5s×条数"，因此读失败的间隙不会把速率算错。
 //!
 //! 反外挂约束：只做整窗截图 + 像素分析，绝不读内存/色块。稳态不需要 WinRT。
+//!
+//! **前台门控**：只有 `Maplestory_Classic.exe` 位于前台时才截图/OCR；否则（切走/最小化/
+//! 点了悬浮卡）整段当作"暂停"——不截图、不计速。暂停时长通过 `PauseClock` 从墙钟里扣掉，
+//! 样本时间轴用的是"活动时钟"（真实时钟 − 累计暂停时长），因此切走再回来的空隙
+//! 不会被算进经验速率（否则会把这个窗口期当成在刷怪，速率被拉低）。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,11 +32,15 @@ use std::time::{Duration, Instant};
 
 use crate::state::{ExpMetrics, SamplerState, Shared};
 
-use super::capture::{capture_window, find_game_hwnd, frame_is_blank, window_geo};
+use super::capture::{
+    capture_window, find_game_hwnd, frame_is_blank, is_game_foreground, window_geo,
+};
 use super::digits;
 
+/// 采样间隔（秒）。另供上报页把"窗内采样条数"换算成实测秒数用，故 pub。
+pub(crate) const SAMPLE_INTERVAL_SECS: u64 = 5;
 /// 采样间隔。
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(SAMPLE_INTERVAL_SECS);
 /// 连续多少次(每 5s 一次)检测不到数据后，才把 实时/预估 EXP 置为 `-`。
 /// 4 次 ≈ 20 秒。期间保留最近一次算出的数值，避免一次抓屏抖动就把读数清成 `-`。
 const MISS_LIMIT: u32 = 4;
@@ -77,6 +86,47 @@ fn dbg(verb: &str, exp: Option<i64>, note: &str) {
     eprintln!("[DEBUG] {t} {verb} EXP={ex}{note}");
 }
 
+/// 前台暂停记账：把"游戏不在前台/进程不在"的墙钟时间累积成 `lag`。
+/// 采样时刻统一用**活动时钟** `active_now = 真实时钟 − lag`——切走/关游戏的那段墙钟
+/// 不会进入样本时间轴，经验速率只按"真正在前台可采样"的时间算（见模块顶部文档）。
+struct PauseClock {
+    /// 至今累计的暂停墙钟时长。
+    lag: Duration,
+    /// 上一 tick 的真实时刻（`step` 前移它并返回本 tick 耗时）。
+    prev: Option<Instant>,
+}
+
+impl PauseClock {
+    fn new() -> Self {
+        PauseClock { lag: Duration::ZERO, prev: None }
+    }
+
+    /// 自上一 tick（或线程启动）以来经过的墙钟时长，并把游标前移到 `now`。
+    fn step(&mut self, now: Instant) -> Duration {
+        match self.prev {
+            None => {
+                self.prev = Some(now);
+                Duration::ZERO
+            }
+            Some(p) => {
+                let d = now.saturating_duration_since(p);
+                self.prev = Some(now);
+                d
+            }
+        }
+    }
+
+    /// 把一段"暂停"墙钟记入累计（本 tick 判定为不采样时调用）。
+    fn pause(&mut self, elapsed: Duration) {
+        self.lag += elapsed;
+    }
+
+    /// 当前活动时刻 = 真实时刻 − 已累计暂停时长（下界 clamp，不会早于时钟原点）。
+    fn active_now(&self, now: Instant) -> Instant {
+        now.checked_sub(self.lag).unwrap_or(now)
+    }
+}
+
 /// 采样线程主循环。`stop=true` 时尽快退出（退出清理阶段调用方负责 join）。
 pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
     // (时间戳, EXP) 样本序列，同级内单调不减。
@@ -86,9 +136,10 @@ pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
 
     // 连续未读到数据的次数；连续 MISS_LIMIT 次(≈20s)后才清掉旧数值显示 `-`。
     let mut miss: u32 = 0;
+    let mut pc = PauseClock::new();
     while !stop.load(Ordering::Relaxed) {
         let t0 = Instant::now();
-        tick(&shared, &mut recs, &mut pending, &mut miss);
+        tick(&shared, &mut recs, &mut pending, &mut miss, &mut pc, t0);
         // 剩余时间分段睡，stop 能及时打断（最长 100ms 响应）。
         let mut waited = t0.elapsed();
         while waited < SAMPLE_INTERVAL && !stop.load(Ordering::Relaxed) {
@@ -107,14 +158,30 @@ fn tick(
     recs: &mut VecDeque<Sample>,
     pending: &mut Vec<Sample>,
     miss: &mut u32,
+    pc: &mut PauseClock,
+    now_real: Instant,
 ) {
+    let wall = pc.step(now_real);
     let Some(hwnd) = find_game_hwnd() else {
+        // 游戏进程不在：无法采样、也不会涨经验，这段墙钟按"暂停"扣掉，回来时速率才连续。
+        pc.pause(wall);
         #[cfg(debug_assertions)]
         dbg("未检测到游戏窗口", None, "");
         set_status(shared, SamplerState::NoGame, "未检测到游戏窗口".into());
         miss_step(shared, miss);
         return;
     };
+    if !is_game_foreground(hwnd) {
+        // 前台门控：只有 Maplestory_Classic.exe 位于前台才截图/OCR，否则经验计时暂停。
+        // 暂停 ≠ 失败：不截图、不清掉已算出的数值（冻结显示），且这段墙钟不进速率。
+        pc.pause(wall);
+        #[cfg(debug_assertions)]
+        dbg("游戏不在前台，经验计时暂停", None, "");
+        set_status(shared, SamplerState::Paused, "游戏不在前台，经验计时暂停".into());
+        return;
+    }
+    // 至此前台可采样。样本用"活动时钟"：扣除此前累计的暂停墙钟，时间轴不因切走而稀释。
+    let now = pc.active_now(now_real);
     let Some(frame) = capture_window(hwnd) else {
         #[cfg(debug_assertions)]
         dbg("无法抓取游戏窗口", None, "");
@@ -144,7 +211,6 @@ fn tick(
         return;
     };
     *miss = 0; // 成功读到数据 → 连续失败计数归零
-    let now = Instant::now();
     let accept = accept_exp(recs, pending, now, exp_now);
     #[cfg(debug_assertions)]
     let note = match accept {
@@ -435,5 +501,29 @@ mod tests {
         prune(&mut recs, now);
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].exp, 300);
+    }
+
+    #[test]
+    fn pause_clock_excludes_background_wall_time() {
+        // 模拟每 5s 一次的 tick：两次前台、一次暂停、一次前台。
+        let t0 = Instant::now();
+        let mut pc = PauseClock::new();
+        assert_eq!(pc.step(t0), Duration::ZERO); // 启动 tick 不算耗时
+        // 前台 tick（5s、5s）：只前移游标，不累加暂停。
+        let t1 = t0 + Duration::from_secs(5);
+        let t2 = t0 + Duration::from_secs(10);
+        assert_eq!(pc.step(t1), Duration::from_secs(5));
+        assert_eq!(pc.step(t2), Duration::from_secs(5));
+        assert_eq!(pc.active_now(t2), t2, "无暂停时活动时钟 == 真实时钟");
+        // 第 3 个 tick 判定游戏不在前台：把这一 tick 的 5s 记入暂停。
+        let t3 = t0 + Duration::from_secs(15);
+        let d = pc.step(t3);
+        assert_eq!(d, Duration::from_secs(5));
+        pc.pause(d);
+        assert_eq!(pc.active_now(t3), t2, "暂停期间活动时钟冻结（停表）");
+        // 第 4 个 tick 回到前台：活动时钟比真实时钟慢 5s（暂停的 5s 不算）。
+        let t4 = t0 + Duration::from_secs(20);
+        assert_eq!(pc.step(t4), Duration::from_secs(5));
+        assert_eq!(pc.active_now(t4), t3, "暂停墙钟被扣除，不稀释速率");
     }
 }

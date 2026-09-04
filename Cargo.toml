@@ -1,6 +1,6 @@
 [package]
 name = "mxd-bar"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
@@ -30,6 +30,7 @@ windows = { version = "0.62", features = [
   "Storage_Streams",
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_Networking_WinHttp",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Storage_Xps",
   "Win32_System_Diagnostics_ToolHelp",
@@ -44,6 +45,12 @@ windows = { version = "0.62", features = [
 windows-future = { version = "0.3.2", default-features = false }
 windows-collections = { version = "0.3.2", default-features = false }
 
+[build-dependencies]
+# 把 app.rc(图标 + 版本 2.0.0 资源) 编进 exe；内部定位系统 rc.exe 编译。
+embed-resource = "2"
+
 [profile.release]
 # 对小程序开 LTO 减小体积（按需可调）。
 lto = "thin"
+# 剥掉符号表，进一步缩小单文件体积。
+strip = true

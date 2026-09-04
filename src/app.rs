@@ -332,10 +332,11 @@ impl MxdBarApp {
                 ctx.request_repaint();
             }
             Action::Manage => {
-                // 打开管理数据占位页（本地网页 + uid 参数）
+                // 打开管理数据页：带当前设备 token（v2，网页据此授权本设备编辑）
                 let url = {
                     let g = self.shared.lock().unwrap();
-                    crate::net::manage_url(g.uid.as_deref().unwrap_or(""))
+                    let base = crate::net::api_base(&g.cfg);
+                    crate::net::manage_url(base, g.token.as_deref())
                 };
                 crate::net::open_url(&url);
             }

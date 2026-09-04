@@ -43,6 +43,11 @@ pub struct AppConfig {
     // —— [meta] ——
     /// 主板序列号 → MD5(32hex)，缓存避免每次启动都跑 PowerShell。
     pub uid_cache: Option<String>,
+
+    // —— [net] ——
+    /// true = 用本地测试地址(http://127.0.0.1:3001)；false = 生产 https://mxd.zhuzhu.website。
+    /// 对应 ini 的 `[net] base=local|prod`（缺省 prod）。改了无需重新编译，方便联调后切回生产。
+    pub net_local: bool,
 }
 
 impl AppConfig {
@@ -166,6 +171,7 @@ impl AppConfig {
         cfg.exp_label = get(ini, "ocr", "exp_label").unwrap_or("EXP").to_owned();
         cfg.level_label = get(ini, "ocr", "level_label").unwrap_or("Lv").to_owned();
         cfg.uid_cache = get(ini, "meta", "uid").map(str::to_owned);
+        cfg.net_local = get(ini, "net", "base").is_some_and(|s| s.eq_ignore_ascii_case("local"));
         cfg
     }
 
@@ -217,6 +223,9 @@ impl AppConfig {
         if let Some(uid) = &self.uid_cache {
             out.push_str(&format!("uid={}\n", uid));
         }
+
+        out.push_str("[net]\n");
+        out.push_str(&format!("base={}\n", if self.net_local { "local" } else { "prod" }));
         out
     }
 }
@@ -278,6 +287,22 @@ mod tests {
         assert_eq!(c.merchant_ref, back.merchant_ref);
         assert_eq!(c.boss, back.boss);
         assert_eq!(c.uid_cache, back.uid_cache);
+        assert_eq!(c.net_local, back.net_local);
+    }
+
+    #[test]
+    fn net_local_roundtrip_and_case_insensitive() {
+        // 默认（不写 [net]）→ 生产
+        assert!(!AppConfig::default().net_local);
+        // base=local 命中；大小写不敏感
+        let local = parse_ini("[net]\nbase=LOCAL\n");
+        assert!(AppConfig::from_ini(&local).net_local);
+        let prod = parse_ini("[net]\nbase=prod\n");
+        assert!(!AppConfig::from_ini(&prod).net_local);
+        // 设了 local 后 render 写回 local，往返一致
+        let mut c = AppConfig::default();
+        c.net_local = true;
+        assert!(AppConfig::from_ini(&parse_ini(&c.render())).net_local);
     }
 
     #[test]
