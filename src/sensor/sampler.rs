@@ -139,15 +139,38 @@ pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
     let mut pc = PauseClock::new();
     while !stop.load(Ordering::Relaxed) {
         let t0 = Instant::now();
+        drain_clear(&shared, &mut recs, &mut pending, &mut miss);
         tick(&shared, &mut recs, &mut pending, &mut miss, &mut pc, t0);
         // 剩余时间分段睡，stop 能及时打断（最长 100ms 响应）。
         let mut waited = t0.elapsed();
         while waited < SAMPLE_INTERVAL && !stop.load(Ordering::Relaxed) {
+            // 清空请求不等到下一 tick（否则暂停/无游戏时最长要 5s 才生效）。
+            drain_clear(&shared, &mut recs, &mut pending, &mut miss);
             let step = (SAMPLE_INTERVAL - waited).min(Duration::from_millis(100));
             std::thread::sleep(step);
             waited = t0.elapsed();
         }
     }
+}
+
+/// 消费 UI 的"清空经验采样队列"请求（主卡刷新图标）。命中后清掉已积累的样本链、
+/// 升级观望缓冲与连续失败计数，并把读数置回 `-`（无样本 → n_hour==0）。
+fn drain_clear(
+    shared: &Arc<Mutex<Shared>>,
+    recs: &mut VecDeque<Sample>,
+    pending: &mut Vec<Sample>,
+    miss: &mut u32,
+) {
+    let mut g = shared.lock().unwrap();
+    if !g.clear_queue {
+        return;
+    }
+    g.clear_queue = false;
+    g.exp = ExpMetrics::default();
+    drop(g); // 本地缓冲只有本线程会碰，放锁后再清，减少持锁时间
+    recs.clear();
+    pending.clear();
+    *miss = 0;
 }
 
 /// 一次完整采样：截图 → 模板分类器读全量 EXP → 单调/升级判定 → 记录 → 按时间窗算速率。
@@ -525,5 +548,204 @@ mod tests {
         let t4 = t0 + Duration::from_secs(20);
         assert_eq!(pc.step(t4), Duration::from_secs(5));
         assert_eq!(pc.active_now(t4), t3, "暂停墙钟被扣除，不稀释速率");
+    }
+
+    // -----------------------------------------------------------------------
+    // "截图读到的 EXP → 实时EXP/分、预估EXP/时" 的准确性
+    //
+    // 以下测试回放"每 5s 从截图读到一个全量 EXP"的读数流（真机由 digits::read_exp_value
+    // 产出），走与实机同一段 accept_exp → metrics 逻辑，断言算出的速率等于设定真值。
+    // 每张"截图"的 EXP 已在 digits.rs 自测里验证能 1:1 读回，这里验证换算本身。
+    // -----------------------------------------------------------------------
+
+    /// 回放一条读数流：`(活动时钟相对秒, Option<EXP>)`，Some=本帧读出（走 accept_exp），
+    /// None=本帧没读出（不记录，但活动时钟照走，EXP 在后续帧里把这段时间的收益补回来）。
+    /// 返回 Ignored(单条误读，不入列)与 LevelUp 的次数，便于断言发生了什么。
+    fn replay(
+        base: Instant,
+        seq: &[(u64, Option<i64>)],
+        recs: &mut VecDeque<Sample>,
+        pending: &mut Vec<Sample>,
+    ) -> (usize, usize) {
+        let (mut ignored, mut levelup) = (0, 0);
+        for (s, e) in seq {
+            if let Some(exp) = *e {
+                match accept_exp(recs, pending, base + Duration::from_secs(*s), exp) {
+                    Accept::Ignored => ignored += 1,
+                    Accept::LevelUp => levelup += 1,
+                    Accept::Recorded => {}
+                }
+            }
+        }
+        (ignored, levelup)
+    }
+
+    /// 每 5s 一条、EXP 线性递增的读数流：k 从 1..=ticks，t=k×5s，EXP=exp0+per_tick×k。
+    /// `miss` 里的序号表示该帧截图没读出（None）。
+    fn linear_reads(ticks: u32, per_tick: i64, exp0: i64, miss: &[u32]) -> Vec<(u64, Option<i64>)> {
+        (1..=ticks)
+            .map(|k| {
+                let exp = exp0 + per_tick * k as i64;
+                (k as u64 * 5, (!miss.contains(&k)).then_some(exp))
+            })
+            .collect()
+    }
+
+    fn rates(recs: &VecDeque<Sample>, base: Instant, end_sec: u64) -> (i64, i64, u32, u32) {
+        metrics(recs, base + Duration::from_secs(end_sec))
+    }
+
+    /// 匀速刷怪：500 EXP/5s = 6000/min = 360,000/h，跑满 2 小时。
+    #[test]
+    fn steady_farming_rates_are_exact() {
+        let base = Instant::now();
+        let mut recs = VecDeque::new();
+        let mut pend = Vec::new();
+        replay(base, &linear_reads(1440, 500, 0, &[]), &mut recs, &mut pend);
+        let (pm, ph, nm, nh) = rates(&recs, base, 1440 * 5);
+        assert_eq!(pm, 6000, "实时EXP/分应 = 6000/min");
+        assert_eq!(ph, 360_000, "预估EXP/时应 = 360,000/h");
+        assert!(nm >= 12, "实时窗应有 ≥12 条样本，实得 {nm}");
+        assert!(nh >= 700, "预估窗应有 1h 内的样本，实得 {nh}");
+        // 2h 数据经过 prune，只保留最近 1h。
+        let front = recs.front().unwrap();
+        assert!(
+            (front.exp - 360_000).abs() <= 500,
+            "最老样本应约在 1h 前(EXP≈360000)，实得 {}",
+            front.exp
+        );
+    }
+
+    /// 读取失败/漏帧：中间整段漏读、结尾连续漏读，EXP 却在照常涨——
+    /// 端到端按真实时间戳差分，平均速率不应被空隙拉偏。
+    #[test]
+    fn missed_reads_do_not_bias_endpoint_rate() {
+        let base = Instant::now();
+        let mut recs = VecDeque::new();
+        let mut pend = Vec::new();
+        // 30 分钟匀速；中间 (600s..720s) 与结尾 (840s..900s) 各有一整段漏读，
+        // 另在第 10、17、100 个序号随机丢几帧。
+        let miss = [10u32, 17, 100, 120, 121, 122, 123, 124, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179];
+        let (ign, lv) = replay(base, &linear_reads(180, 500, 0, &miss), &mut recs, &mut pend);
+        assert_eq!(ign, 0);
+        assert_eq!(lv, 0);
+        let (pm, ph, ..) = rates(&recs, base, 180 * 5);
+        assert_eq!(pm, 6000, "漏读不应拉偏实时速率");
+        assert_eq!(ph, 360_000, "漏读不应拉偏预估速率");
+    }
+
+    /// 单次读到更小的值（OCR 瞬时误读）：该条被忽略不入列，历史与速率不受污染。
+    #[test]
+    fn single_bad_read_is_ignored_and_rates_continue() {
+        let base = Instant::now();
+        let mut seq = linear_reads(180, 500, 0, &[]);
+        // 把第 60 个序号那一帧的读数改成"比上一条还小"（误读成低值）。
+        let k = 60;
+        let dip_t = k as u64 * 5;
+        seq[(k - 1) as usize] = (dip_t, Some(500 * (k as i64 - 1) - 7));
+        let mut recs = VecDeque::new();
+        let mut pend = Vec::new();
+        let (ign, lv) = replay(base, &seq, &mut recs, &mut pend);
+        assert_eq!(ign, 1, "这一条低值应被当作瞬时误读忽略");
+        assert_eq!(lv, 0);
+        assert_eq!(
+            recs.len(),
+            179,
+            "只应少记一条(误读不入列)，实得 {}",
+            recs.len()
+        );
+        let (pm, ph, ..) = rates(&recs, base, 180 * 5);
+        assert_eq!(pm, 6000, "单条误读后实时速率不变");
+        assert_eq!(ph, 360_000, "单条误读后预估速率不变");
+    }
+
+    /// 升级：EXP 一次大跌、连续 3 条低于此前平均 → 判定升级并重置；
+    /// 之后以新等级低值重新累积，速率回到新等级的真实斜率，不出现负值/失真。
+    #[test]
+    fn levelup_resets_then_new_level_rate_is_true() {
+        let base = Instant::now();
+        let mut recs = VecDeque::new();
+        let mut pend = Vec::new();
+        let tick = |secs: u64| base + Duration::from_secs(secs);
+
+        // 阶段 1：旧等级匀速刷 30 分钟，500 EXP/5s。
+        for k in 1..=360 {
+            assert_eq!(accept_exp(&mut recs, &mut pend, tick(5 * k), 500 * k as i64), Accept::Recorded);
+        }
+        let old_last = recs.back().unwrap().exp; // 180,000
+        // 阶段 2：升级——读数瞬间大跌到新等级的头部低值，连续 3 条仍低于旧平均。
+        assert_eq!(accept_exp(&mut recs, &mut pend, tick(1805), 1500), Accept::Ignored);
+        assert_eq!(accept_exp(&mut recs, &mut pend, tick(1810), 2000), Accept::Ignored);
+        assert_eq!(accept_exp(&mut recs, &mut pend, tick(1815), 2500), Accept::LevelUp);
+        assert_eq!(recs.len(), 1, "升级后旧段作废，只留新起点");
+        assert_eq!(recs[0].exp, 2500);
+        assert!(old_last > 2500);
+        // 刚重置只有 1 条 → 先显示 `-`（全 0），与 UI 的 n_hour==0 一致。
+        assert_eq!(metrics(&recs, tick(1815)), (0, 0, 0, 0));
+        // 阶段 3：新等级继续按 500 EXP/5s 爬升，跑 ~3.5 分钟后速率应回到 6000/min。
+        for k in 364..=404 {
+            // k=364 → t=1820，exp 从 2500+500 继续
+            let t = 5 * k;
+            let exp = 2500 + 500 * (k - 363) as i64;
+            assert_eq!(accept_exp(&mut recs, &mut pend, tick(t), exp), Accept::Recorded);
+        }
+        let (pm, ph, ..) = rates(&recs, base, 5 * 404);
+        assert_eq!(pm, 6000, "升级重置后，实时速率应反映新等级斜率");
+        assert_eq!(ph, 360_000, "升级重置后，预估速率应反映新等级斜率");
+    }
+
+    /// 近期提速：实时(60s 窗)应贴住最近的速度，预估(≤1h 窗)则是整段平均——两者都对，
+    /// 只是口径不同。rateA=100/s(6000/min) 40 分钟，之后提速到 200/s(12000/min) 30 分钟。
+    #[test]
+    fn recent_speedup_realtime_vs_hourly_average_differ() {
+        let base = Instant::now();
+        let mut seq: Vec<(u64, Option<i64>)> = Vec::with_capacity(840);
+        let mut exp = 0i64;
+        for k in 1..=840 {
+            // t 5..2400s: +500/tick；2405..4200s: +1000/tick
+            let per = if k <= 480 { 500 } else { 1000 };
+            exp += per;
+            seq.push((k as u64 * 5, Some(exp)));
+        }
+        let mut recs = VecDeque::new();
+        let mut pend = Vec::new();
+        replay(base, &seq, &mut recs, &mut pend);
+        let (pm, ph, ..) = rates(&recs, base, 840 * 5);
+        assert_eq!(pm, 12_000, "最近 60s 全在提速后，实时应 ≈ 12,000/min");
+        assert_eq!(ph, 540_000, "最近 1h 含两段(100/s 与 200/s 各 30min)，预估 = 平均 540,000/h");
+        assert_ne!(pm, ph / 60, "实时≠每小时折算均值，说明两窗口径不同属预期");
+    }
+
+    /// 刚启动/刚重置、样本不足（<2 条）→ 全 0，UI 显示 `-`，绝不显示编造的速率。
+    #[test]
+    fn too_early_shows_dash_not_bogus_rate() {
+        let base = Instant::now();
+        let mut recs = VecDeque::new();
+        let mut pend = Vec::new();
+        assert_eq!(rates(&recs, base, 5), (0, 0, 0, 0), "一条都还没有 → `-`");
+        replay(base, &linear_reads(1, 500, 0, &[]), &mut recs, &mut pend);
+        assert_eq!(rates(&recs, base, 5), (0, 0, 0, 0), "只有 1 条 → `-`");
+    }
+
+    /// 端到端：把每帧"截图"(合成像素)喂给真正的 read_exp_value，得到 EXP 整数，
+    /// 再过 accept_exp→metrics——证明"截图→EXP→实时/预估"整条链路没有断点。
+    #[test]
+    fn synthetic_screenshot_pixels_to_rates_e2e() {
+        let base = Instant::now();
+        let mut recs = VecDeque::new();
+        let mut pend = Vec::new();
+        // 从一段真实的当前 EXP 起步（跨 6 位、含 0），每 5s +500（6000/min）。
+        let mut exp = 100_000i64;
+        for k in 1..=40 {
+            exp += 500;
+            let f = crate::sensor::digits::synth_value_frame(&exp.to_string(), 758, 900, 800);
+            let read = crate::sensor::digits::read_exp_value(&f)
+                .unwrap_or_else(|| panic!("第 {k} 帧应读出 EXP，画面值={exp}"));
+            assert_eq!(read, exp, "第 {k} 帧截图应 1:1 读回 EXP");
+            accept_exp(&mut recs, &mut pend, base + Duration::from_secs(5 * k), read);
+        }
+        let (pm, ph, ..) = rates(&recs, base, 5 * 40);
+        assert_eq!(pm, 6000, "合成截图像素流换算出的 实时EXP/分 应=6000/min");
+        assert_eq!(ph, 360_000, "合成截图像素流换算出的 预估EXP/时 应=360,000/h");
     }
 }

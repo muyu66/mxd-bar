@@ -145,6 +145,10 @@ pub struct Shared {
     // —— sampler 写、UI 读 ——
     pub exp: ExpMetrics,
     pub sampler: SamplerStatus,
+    /// UI 请求清空经验采样队列（主卡最右的刷新图标）。sampler 线程每轮循环消费后复位 false。
+    /// 置位后 sampler 会清掉已积累的 (时间戳,EXP) 样本链、升级观望缓冲与连续失败计数，
+    /// 并把读数置回 `-`（ExpMetrics 清零）；经验速率随后从新样本重新累积。
+    pub clear_queue: bool,
     // —— UI 导航 ——
     pub page: Page,
     pub report: ReportState,
@@ -172,6 +176,7 @@ impl Shared {
         Shared {
             exp: ExpMetrics::default(),
             sampler: SamplerStatus::default(),
+            clear_queue: false,
             page: Page::None,
             report: ReportState::default(),
             pick: PickState::default(),

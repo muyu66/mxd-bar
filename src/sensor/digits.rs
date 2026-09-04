@@ -193,3 +193,91 @@ pub fn read_exp_value(frame: &BgraFrame) -> Option<i64> {
     }
     best.map(|(_, _, v)| v)
 }
+
+// ---------------------------------------------------------------------------
+// 自测：合成"截图"帧验证读 EXP
+// ---------------------------------------------------------------------------
+
+/// 测试专用：把一段十进制数字串按本模块标定的值区几何画成一帧 BGRA"截图"
+/// （数字从 `gx0` 起、每个 6px 一格，字形 = 内嵌模板 TPL，ink 亮度≈240、背景≈40）。
+/// 等价于把真实屏幕上这段 EXP 数字原样画进像素缓冲，供 `read_exp_value` 离线回归。
+/// 只在 test 构建编入（sampler 的端到端测试也复用它）。
+#[cfg(test)]
+pub(crate) fn synth_value_frame(value: &str, gx0: i32, w: i32, h: i32) -> BgraFrame {
+    debug_assert!(value.bytes().all(|b| b.is_ascii_digit()), "只支持 0-9");
+    let wu = w as usize;
+    let mut px = vec![40u8; wu * h as usize * 4]; // BGRA，背景 lum≈40（<LUM_THR）
+    for p in px.chunks_exact_mut(4) {
+        p[3] = 255;
+    }
+    for (i, ch) in value.bytes().enumerate() {
+        let d = (ch - b'0') as usize;
+        let gx = gx0 + (i as i32) * CELL_W as i32;
+        for (r, row) in TPL[d].iter().enumerate() {
+            let y = Y_TOP + r as i32;
+            for (c, &ink) in row.iter().enumerate() {
+                if ink == 1 {
+                    let x = gx + c as i32;
+                    let o = (y as usize * wu + x as usize) * 4;
+                    px[o] = 240;
+                    px[o + 1] = 240;
+                    px[o + 2] = 240; // lum≈240（≥LUM_THR）
+                    px[o + 3] = 255;
+                }
+            }
+        }
+    }
+    BgraFrame { w, h, pixels: px }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 画一整帧纯背景（无任何值区 ink），用于几何守卫测试。
+    fn blank(w: i32, h: i32) -> BgraFrame {
+        let mut px = vec![40u8; w as usize * h as usize * 4];
+        for p in px.chunks_exact_mut(4) {
+            p[3] = 255;
+        }
+        BgraFrame { w, h, pixels: px }
+    }
+
+    #[test]
+    fn reads_synthesized_value_region() {
+        // 各种位长/含 0 的实际 EXP 值；数字落在 x0 搜索窗内的不同位置。
+        let cases = [
+            ("527819", 756),
+            ("1200", 758),
+            ("38", 752),
+            ("7", 761),
+            ("700000", 757),
+            ("9999999", 758),
+            ("0", 758),
+            ("1", 751),
+        ];
+        for (s, gx) in cases {
+            let want = s.parse::<i64>().unwrap();
+            let got = read_exp_value(&synth_value_frame(s, gx, 900, 800));
+            assert_eq!(got, Some(want), "把 {s} 画在 gx0={gx} 应读回 {want}");
+        }
+    }
+
+    #[test]
+    fn absorbs_anchor_drift_within_search_window() {
+        // 值区首格 ±1px 漂移（实机 756/757 都见过）：只要锚点在 751..=762 内都应读对。
+        for gx in 751..=762 {
+            let got = read_exp_value(&synth_value_frame("527819", gx, 900, 800));
+            assert_eq!(got, Some(527_819), "数字首格漂移到 gx0={gx} 仍应读回 527819");
+        }
+    }
+
+    #[test]
+    fn geometry_guard_returns_none() {
+        // 帧太小（几何不符）→ None：分别卡在宽 / 高守卫上。
+        assert_eq!(read_exp_value(&blank(830, 800)), None, "宽不足 834 → None");
+        assert_eq!(read_exp_value(&blank(900, 770)), None, "高不足 779 → None");
+        // 大小够但没有数字 → None。
+        assert_eq!(read_exp_value(&blank(900, 800)), None, "值区无 ink → None");
+    }
+}
