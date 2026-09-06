@@ -14,8 +14,10 @@
 //!   - 若**连续 3 条都低于原平均**（≈15s；只有升级后从低位爬升才会如此）→ **判定升级，重置**
 //!     —— 清掉旧段，以这一串低值的最新一条为新的起点重新累积；
 //!   - 期间若回到 ≥ 原平均 → 前面的低值当误读作废，恢复正常记录；
-//! - **实时EXP/分** = 最近 60s 时间窗内 (ΔEXP)/(Δt) ×60；
-//!   **预估EXP/时** = 最近 ≤1h 时间窗内 (ΔEXP)/(Δt) ×3600。窗口不足 2 条/时长太短 → 显示 `-`。
+//! - **实时EXP/分** = 最近**恰好 60s** 尾随窗的实测净增；**预估EXP/时** = 最近**恰好 1h** 尾随窗的
+//!   实测净增。窗起点精确落在 `now − win`，若落在两样本之间按折线线性插值（同心电图口径），
+//!   因此边界那一跳不会被整段剔出窗外而低估（见 `window_gain`）。样本链还没攒满一个窗口时，
+//!   退化为"窗内两样本速率 × 窗时长"外推，启动初期照常出数；样本不足 2 条/跨度太短 → 显示 `-`。
 //!   用真实时间戳而不是"5s×条数"，因此读失败的间隙不会把速率算错。
 //!
 //! 反外挂约束：只做整窗截图 + 像素分析，绝不读内存/色块。稳态不需要 WinRT。
@@ -337,7 +339,8 @@ fn prune(recs: &mut VecDeque<Sample>, now: Instant) {
 }
 
 /// 取时间窗内首尾两点的平均速率 (EXP/秒) 与窗内样本条数。
-/// 窗口内不足 2 条时退化为最近两条（已保留 ≤1h）；样本 <2 或首尾跨度 <MIN_SPAN 返回 None。
+/// 供 `window_gain` 在"样本链尚未盖满整窗"时作速率外推回退；窗口内不足 2 条时退化为最近两条
+/// （已保留 ≤1h）；样本 <2 或首尾跨度 <MIN_SPAN 返回 None。
 fn window_rate(recs: &VecDeque<Sample>, now: Instant, win: Duration) -> Option<(f64, usize)> {
     if recs.len() < 2 {
         return None;
@@ -367,19 +370,40 @@ fn window_rate(recs: &VecDeque<Sample>, now: Instant, win: Duration) -> Option<(
     Some((de / dt.as_secs_f64(), n - lo))
 }
 
-/// 换算两个展示指标。样本 <2（启动/重置初期）→ 全 0，UI 用 n_hour==0 显示 `-`。
-fn metrics(recs: &VecDeque<Sample>, now: Instant) -> (i64, i64, u32, u32) {
-    match (
-        window_rate(recs, now, MIN_WINDOW),
-        window_rate(recs, now, HOUR_WINDOW),
-    ) {
-        (Some((rm, cm)), Some((rh, ch))) => {
-            let per_min = (rm * 60.0).round() as i64;
-            let per_hour = (rh * 3600.0).round() as i64;
-            (per_min, per_hour, cm as u32, ch as u32)
-        }
-        _ => (0, 0, 0, 0),
+/// 最近"恰好 `win` 时长"尾随窗的实测净增 EXP（分钟窗 → 实时EXP/分、小时窗 → 预估EXP/时）
+/// 与窗内样本条数。窗起点精确落在 `now − win`：
+/// - **盖满**（已运行 ≥ win 且链上最早样本 ≤ now−win）：起点落点用 `exp_at` 折线插值取值，
+///   净增 = 末样本 EXP − exp_at(now − win)。边界那一跳只按其落在窗内的比例计入，不会整段被
+///   剔出窗外而低估（此前窗口起点吸附样本点，60s 边界整段丢失）。
+/// - **未盖满**（启动初期/运行不足一个窗口）：退化为 `window_rate` 两样本速率 × 窗时长外推，
+///   保证刚开刷也能照常出数。
+/// 两者都无法计算 → None（`metrics` 归 0 → UI 显示 `-`）。
+fn window_gain(recs: &VecDeque<Sample>, now: Instant, win: Duration) -> Option<(i64, usize)> {
+    if recs.len() < 2 {
+        return None;
     }
+    let cutoff = now.checked_sub(win);
+    let covered = cutoff.is_some_and(|c| recs.front().is_some_and(|f| f.at <= c));
+    if covered {
+        let c = cutoff.unwrap(); // 已保证 Some
+        let gained = (recs.back().unwrap().exp - exp_at(recs, c)).max(0);
+        let n = recs.iter().filter(|s| s.at >= c).count(); // 与旧 `n−lo` 口径一致
+        return Some((gained, n));
+    }
+    // 未盖满：两样本速率 × 窗时长外推。
+    let (rate, n) = window_rate(recs, now, win)?;
+    Some(((rate * win.as_secs_f64()).round() as i64, n))
+}
+
+/// 换算两个展示指标。样本 <2 / 无法估算（启动、重置初期）→ 全 0，UI 用 n_hour==0 显示 `-`。
+fn metrics(recs: &VecDeque<Sample>, now: Instant) -> (i64, i64, u32, u32) {
+    let (Some((per_min, n_min)), Some((per_hour, n_hour))) = (
+        window_gain(recs, now, MIN_WINDOW),
+        window_gain(recs, now, HOUR_WINDOW),
+    ) else {
+        return (0, 0, 0, 0);
+    };
+    (per_min, per_hour, n_min as u32, n_hour as u32)
 }
 
 /// 样本链 (at,exp) 在时刻 `t` 的 EXP 值：落在相邻两样本之间时做线性插值。
@@ -797,6 +821,46 @@ mod tests {
         let (pm, ph, ..) = rates(&recs, base, 5 * 40);
         assert_eq!(pm, 6000, "合成截图像素流换算出的 实时EXP/分 应=6000/min");
         assert_eq!(ph, 360_000, "合成截图像素流换算出的 预估EXP/时 应=360,000/h");
+    }
+
+    /// 回归：用户实测这批每 5s 全量 EXP（01:15:32→01:16:32，恰好 13 条/60s），实时EXP/分
+    /// 应 = 这一整分钟的实测净增 476,193−472,974 = 3,219，而不是因边界被截短成 2,769。
+    #[test]
+    fn bursty_minute_exact_alignment_is_minute_sum() {
+        let base = Instant::now();
+        let vals = [
+            472_974, 473_655, 473_899, 474_066, 474_156, 474_554, 474_785, //
+            475_196, 475_196, 475_273, 475_387, 475_693, 476_193,
+        ];
+        let mut recs = VecDeque::new();
+        for (i, v) in vals.iter().enumerate() {
+            recs.push_back(Sample { at: base + Duration::from_secs(i as u64 * 5), exp: *v });
+        }
+        let (pm, _, nm, _) = metrics(&recs, base + Duration::from_secs(60));
+        assert_eq!(pm, 3219, "整 60s 对齐时 实时EXP/分 应 = 这一分钟实测净增");
+        assert_eq!(nm, 13);
+    }
+
+    /// 回归：真实 tick 略超 5s（t0→t1 = 5.3s，末样本距 t0 = 60.3s），60s 边界落到两样本之间。
+    /// 旧算法窗起点吸附到 t1，把 +681 整段丢出窗外 → (476,193−473,655)/55s×60 ≈ 2,769（低估）；
+    /// 新算法在 now−60s=0.3s 处插值，这段只按其落在窗内的比例计入 → 476,193 − 473,013 = 3,180。
+    #[test]
+    fn bursty_minute_drifted_boundary_not_under_counted() {
+        let base = Instant::now();
+        let vals = [
+            472_974, 473_655, 473_899, 474_066, 474_156, 474_554, 474_785, //
+            475_196, 475_196, 475_273, 475_387, 475_693, 476_193,
+        ];
+        // 时刻(相对秒)：t0=0，t1=5.3，其后每 5.0 → t12=60.3。EXP 与上条同序列。
+        let mut recs = VecDeque::new();
+        for (i, v) in vals.iter().enumerate() {
+            let t = if i == 0 { 0.0 } else { 5.3 + (i as f64 - 1.0) * 5.0 };
+            recs.push_back(Sample { at: base + Duration::from_secs_f64(t), exp: *v });
+        }
+        let (pm, _, nm, _) = metrics(&recs, base + Duration::from_secs_f64(60.3));
+        assert_eq!(pm, 3180, "边界漂移时 实时EXP/分 应插值接近整分钟(3,219)，而非旧算法的 2,769");
+        assert!(pm > 3000, "无论如何不应再低估到 2,769");
+        assert_eq!(nm, 12);
     }
 
     // —— 心电图数据：近 1 分钟逐 5s 净增 EXP ——
