@@ -1,9 +1,10 @@
 //! `--digit [img...]`：内嵌 0-9 模板分类器的离线回归（仅 debug 构建编入）。
 //!
 //! 与实机同一代码路径（`digits::read_exp_value`），对离线帧跑分类器并对照真值。
-//! 真值来源：文件名本身就是数字 → 用之；`here_full.bmp`=527819、`mxdbar_tesslive_cap.bmp`=534852
-//! 是已知抓帧 → 手写映射。默认跑 test-img/*.png（含 88/0 等边界）+ 上述两张根目录 BMP，
-//! 复验 20/20。用于上线实机前先验证分类器读数。
+//! 真值来源：文件名本身就是数字 → 用之；`here_full.bmp`=527819、`mxdbar_tesslive_cap.bmp`=534852、
+//! `未知_1920x1080.png`=1212644 是已知抓帧 → 手写映射；`test-resolution/2k_3840x2160_7532.png` 这类 → 末段 `_7532`。
+//! 默认跑 test-img/*.png（含 88/0 等边界）+ 两张根目录 BMP + test-resolution/*.png（8 张，排除 *_exp 裁图），
+//! 合计 28 张，全 ✓ 才算出厂回归门。用于上线实机前先验证分类器读数。
 //!
 //! 读图不走任何 OCR：这里只保留 WinRT `StorageFile→BitmapDecoder→SoftwareBitmap`
 //! 解码成 Bgra8 裸像素的路径（Windows 自带解码 PNG/BMP，无需额外图片库）。
@@ -133,6 +134,7 @@ pub fn run() -> eframe::Result {
         args.iter().skip(2).cloned().collect()
     } else {
         let mut v = vec![];
+        // test-img/*.png：文件名本身就是真值（18 张）。
         if let Ok(rd) = std::fs::read_dir("test-img") {
             for e in rd.flatten() {
                 let p = e.path();
@@ -147,10 +149,29 @@ pub fn run() -> eframe::Result {
             }
         }
         v.sort();
+        // 根目录两张已知抓帧。
         for extra in ["here_full.bmp", "mxdbar_tesslive_cap.bmp"] {
             if Path::new(extra).exists() {
                 v.push(extra.to_string());
             }
+        }
+        // test-resolution/*.png：排除 `_exp` 裁图（8 张），真值见 truth_of（末段 `_<整数>` 或手写映射）。
+        if let Ok(rd) = std::fs::read_dir("test-resolution") {
+            let mut rr: Vec<String> = rd
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().and_then(|s| s.to_str()) == Some("png")
+                        && p
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|s| !s.contains("_exp"))
+                })
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            rr.sort();
+            v.extend(rr);
         }
         v
     };
@@ -166,12 +187,17 @@ pub fn run() -> eframe::Result {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| ip.clone());
-        // 真值：文件名本身是数字 → 用之；here_full / cap 是已知抓帧 → 手写。
-        let truth: Option<i64> = stem.parse::<i64>().ok().or_else(|| match stem.as_str() {
-            "here_full" => Some(527_819),
-            "mxdbar_tesslive_cap" => Some(534_852),
-            _ => None,
-        });
+        // 真值：文件名本身是数字 → 用之；here_full / cap / 未知_1920x1080 是已知抓帧 → 手写映射；
+        // test-resolution 这类 `2k_3840x2160_7532` → 末段 `_7532`。
+        let truth: Option<i64> = stem
+            .parse::<i64>()
+            .ok()
+            .or_else(|| match stem.as_str() {
+                "here_full" => Some(527_819),
+                "mxdbar_tesslive_cap" => Some(534_852),
+                "未知_1920x1080" => Some(1_212_644),
+                _ => stem.rsplit('_').next().and_then(|t| t.parse::<i64>().ok()),
+            });
         match decode_file(&abs) {
             Ok((w, h, px)) => {
                 let fr = BgraFrame { w, h, pixels: px };

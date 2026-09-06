@@ -8,4 +8,5 @@
 
 pub mod capture;
 pub mod digits;
+pub mod region;
 pub mod sampler;

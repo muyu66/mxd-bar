@@ -167,8 +167,9 @@ fn decode_at(frame: &BgraFrame, x0: i32) -> (Vec<u8>, u32, u32) {
     (digits, cost, solids)
 }
 
-/// 读当前级累积 EXP 的全量整数。读不到（值区被盖/分辨率不符/几何漂出窗口）返回 None。
-pub fn read_exp_value(frame: &BgraFrame) -> Option<i64> {
+/// 读当前级累积 EXP 的全量整数（只对 1382×807 原生整窗几何生效）。读不到返回 None。
+/// 多分辨率改由 `read_exp_value` 先走 `region::locate` 锚定位，此函数作回退。
+fn read_exp_value_native(frame: &BgraFrame) -> Option<i64> {
     // 值区按 1382×807 标定；至少留到 X0_HI+12 格、Y_TOP+14 行，否则几何不适用。
     if frame.w < X0_HI + 6 * 12 || frame.h < Y_TOP + ROWS {
         return None;
@@ -192,6 +193,336 @@ pub fn read_exp_value(frame: &BgraFrame) -> Option<i64> {
         }
     }
     best.map(|(_, _, v)| v)
+}
+
+// ---------------------------------------------------------------------------
+// 多分辨率双路读 EXP：region 颜色定位 → 条内淡绿 `[` 左侧比例字 OCR。
+// ---------------------------------------------------------------------------
+
+/// 读经验值的统一入口：
+/// 1. `region::locate` 颜色定位出经验数值条 + 左括号列 → 条内读 bl 左边数字（多分辨率，含原生帧）；
+/// 2. 锚定位读不出（找不到红商城/无括号）→ 回退原生 1382×807 几何读数。
+/// 颜色只用来定位；数值一律走下方字形 OCR。
+pub fn read_exp_value(frame: &BgraFrame) -> Option<i64> {
+    if let Some(reg) = super::region::locate(frame) {
+        let bw = reg.x1 - reg.x0;
+        let bh = reg.y1 - reg.y0;
+        if let Some(v) = read_band_left_of_bracket(&reg.g, bw, bh, reg.bracket_col) {
+            return Some(v);
+        }
+    }
+    read_exp_value_native(frame)
+}
+
+/// 单格 OCR 最低失配上限（fraction，同 Python MIS_MAX=0.20）。
+const MIS_MAX: f32 = 0.20;
+
+/// 单个候选字：低失配数字 + 失配率 + 右缘列 + 字高（分组行内 ink 行数）。
+struct Cell {
+    d: Option<u8>,
+    mis: f32,
+    xb: i32,
+    hgt: i32,
+}
+
+/// 模板数字 d 的 ink 外接框：(顶行, 左列, 行数, 列数)。
+fn tpl_ink(d: usize) -> (i32, i32, i32, i32) {
+    let mut top = ROWS as i32;
+    let mut bot = -1;
+    let mut left = CELL_W as i32;
+    let mut right = -1;
+    for r in 0..ROWS as usize {
+        for c in 0..CELL_W {
+            if TPL[d][r][c] == 1 {
+                top = top.min(r as i32);
+                bot = bot.max(r as i32);
+                left = left.min(c as i32);
+                right = right.max(c as i32);
+            }
+        }
+    }
+    (top, left, bot - top + 1, right - left + 1)
+}
+
+/// 闭区间重叠长度（a≤b、c≤d），负则取 0。
+fn overlap(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    (b.min(d) - a.max(c)).max(0.0)
+}
+
+/// 把 sh×sw 的 0/1 字形按面积平均重采样到 th×tw（逐像素精确覆盖，不加图片库）。
+/// 返回 th×tw 的 0..1 覆盖率。
+fn resample_area(src: &[u8], sh: i32, sw: i32, th: i32, tw: i32) -> Vec<f64> {
+    let mut out = vec![0f64; (th * tw) as usize];
+    if sh <= 0 || sw <= 0 || th <= 0 || tw <= 0 {
+        return out;
+    }
+    for tr in 0..th {
+        let ya = tr as f64 * sh as f64 / th as f64;
+        let yb = (tr + 1) as f64 * sh as f64 / th as f64;
+        for tc in 0..tw {
+            let xa = tc as f64 * sw as f64 / tw as f64;
+            let xb = (tc + 1) as f64 * sw as f64 / tw as f64;
+            let mut sum = 0f64;
+            for i in (ya.floor() as i32)..(yb.ceil() as i32) {
+                if i < 0 || i >= sh {
+                    continue;
+                }
+                let wy = overlap(ya, yb, i as f64, (i + 1) as f64);
+                if wy <= 0.0 {
+                    continue;
+                }
+                let base = (i * sw) as usize;
+                for j in (xa.floor() as i32)..(xb.ceil() as i32) {
+                    if j < 0 || j >= sw {
+                        continue;
+                    }
+                    let wx = overlap(xa, xb, j as f64, (j + 1) as f64);
+                    if wx <= 0.0 {
+                        continue;
+                    }
+                    sum += src[base + j as usize] as f64 * wy * wx;
+                }
+            }
+            let area = (yb - ya) * (xb - xa);
+            out[(tr * tw + tc) as usize] = if area > 0.0 { sum / area } else { 0.0 };
+        }
+    }
+    out
+}
+
+/// 对已裁 ink 外接框的 0/1 字形做比例 OCR：与 10 个模板各自动框分别面积重采样，
+/// 二值化(>0.5)后算失配率，取最小 → (digit, 失配率)。
+fn ocr_cell(src: &[u8], sh: i32, sw: i32) -> Option<(u8, f32)> {
+    let mut best: Option<(u8, f32)> = None;
+    for d in 0..10 {
+        let (trow, tcol, th, tw) = tpl_ink(d);
+        let mut tplv = vec![0u8; (th * tw) as usize];
+        for r in 0..th as usize {
+            for c in 0..tw as usize {
+                tplv[r * tw as usize + c] = TPL[d][trow as usize + r][tcol as usize + c];
+            }
+        }
+        let avg = resample_area(src, sh, sw, th, tw);
+        let mut mis = 0f64;
+        let total = (th * tw) as f64;
+        for k in 0..(th * tw) as usize {
+            let bin = if avg[k] > 0.5 { 1.0 } else { 0.0 };
+            mis += (bin - tplv[k] as f64).abs();
+        }
+        let mf = mis / total;
+        if best.is_none() || mf < best.unwrap().1 as f64 {
+            best = Some((d as u8, mf as f32));
+        }
+    }
+    best
+}
+
+/// 众数（平局取先出现者，同 Python Counter.most_common(1) 的稳定序）。
+fn mode(xs: &[i32]) -> i32 {
+    let mut counts: Vec<(i32, i32)> = Vec::new();
+    for &v in xs {
+        if let Some(e) = counts.iter_mut().find(|(k, _)| *k == v) {
+            e.1 += 1;
+        } else {
+            counts.push((v, 1));
+        }
+    }
+    let mut best = counts[0];
+    for c in &counts {
+        if c.1 > best.1 {
+            best = *c;
+        }
+    }
+    best.0
+}
+
+/// 字典序比较候选键 (thr, -len, -右缘, avg)：更小者胜。
+fn key_better(a: &(i32, i32, i32, f32), b: &(i32, i32, i32, f32)) -> bool {
+    if a.0 != b.0 {
+        return a.0 < b.0;
+    }
+    if a.1 != b.1 {
+        return a.1 < b.1;
+    }
+    if a.2 != b.2 {
+        return a.2 < b.2;
+    }
+    a.3 < b.3
+}
+
+/// 在条带灰度 `g`（宽 bw×高 bh，行主序）里，取左括号 `[`（列 bl）左侧的 EXP 值数字串。
+/// 亮/暗 × 多阈值，逐字 ink-bbox 归一 OCR，取「低失配、同高、尽量长、尽量贴括号」的字段。
+fn read_band_left_of_bracket(g: &[u8], bw: i32, bh: i32, bl: i32) -> Option<i64> {
+    if bl < 3 {
+        return None;
+    }
+    let bwu = bw as usize;
+    let bhu = bh as usize;
+    let blu = bl as usize;
+    let mut best: Option<((i32, i32, i32, f32), i64)> = None;
+    for pol in 0..2 {
+        for &thr in &[120, 150, 190] {
+            // 左条带 white 掩码：亮极性 = luma≥thr，暗极性 = luma≤255-thr。
+            let mut white = vec![false; bhu * blu];
+            for y in 0..bh {
+                let base = (y as usize) * bwu;
+                let yo = (y as usize) * blu;
+                for x in 0..bl {
+                    let v = g[base + x as usize] as i32;
+                    white[yo + x as usize] = if pol == 0 { v >= thr } else { v <= 255 - thr };
+                }
+            }
+            // 文本行：行 ink 数 ∈ [3, 0.6·bl]。
+            let hi = (6 * blu) / 10;
+            let mut rows: Vec<i32> = Vec::new();
+            for y in 0..bh {
+                let mut c = 0i32;
+                let yo = (y as usize) * blu;
+                for &w in &white[yo..yo + blu] {
+                    if w {
+                        c += 1;
+                    }
+                }
+                if c >= 3 && (c as usize) <= hi {
+                    rows.push(y);
+                }
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            // 相邻文本行 gap>2 分段。
+            let mut gs = 0usize;
+            for gi in 0..rows.len() {
+                let is_end = gi + 1 == rows.len() || rows[gi + 1] - rows[gi] > 2;
+                if !is_end {
+                    continue;
+                }
+                let r0 = rows[gs];
+                let r1 = rows[gi];
+                // 列向空白裂字（跨整组行的全空列 = 字符边界）。
+                let mut spans: Vec<(i32, i32)> = Vec::new();
+                let mut cur: Option<i32> = None;
+                for x in 0..bl {
+                    let mut any = false;
+                    for y in r0..=r1 {
+                        if white[(y as usize) * blu + x as usize] {
+                            any = true;
+                            break;
+                        }
+                    }
+                    if any {
+                        if cur.is_none() {
+                            cur = Some(x);
+                        }
+                    } else if let Some(s) = cur.take() {
+                        spans.push((s, x - 1));
+                    }
+                }
+                if let Some(s) = cur.take() {
+                    spans.push((s, bl - 1));
+                }
+                let mut cells: Vec<Cell> = Vec::new();
+                for (xa, xb) in spans {
+                    if xb - xa < 1 {
+                        continue; // 字宽需 ≥2（同 Python）
+                    }
+                    let gh = (r1 - r0 + 1) as usize;
+                    let wc = (xb - xa + 1) as usize;
+                    let mut anyrow = vec![false; gh];
+                    let mut anycol = vec![false; wc];
+                    for (ii, y) in (r0..=r1).enumerate() {
+                        let yo = (y as usize) * blu + xa as usize;
+                        for jj in 0..wc {
+                            if white[yo + jj] {
+                                anyrow[ii] = true;
+                                anycol[jj] = true;
+                            }
+                        }
+                    }
+                    if !anyrow.iter().any(|&b| b) {
+                        continue;
+                    }
+                    let top = anyrow.iter().position(|&b| b).unwrap();
+                    let bot = anyrow.iter().rposition(|&b| b).unwrap();
+                    let hgt = (bot - top + 1) as i32;
+                    if hgt < 3 {
+                        continue;
+                    }
+                    let left = anycol.iter().position(|&b| b).unwrap();
+                    let right = anycol.iter().rposition(|&b| b).unwrap();
+                    let sw = (right - left + 1) as i32;
+                    let sh = (bot - top + 1) as i32;
+                    // 裁 ink 外接框的 0/1 字形 → OCR。
+                    let mut src = vec![0u8; (sh as usize) * (sw as usize)];
+                    for ii in top..=bot {
+                        let y = r0 + ii as i32;
+                        let yo = (y as usize) * blu + (xa as usize + left);
+                        for jj in left..=right {
+                            if white[yo + (jj - left)] {
+                                src[(ii - top) * (sw as usize) + (jj - left)] = 1;
+                            }
+                        }
+                    }
+                    let rr = ocr_cell(&src, sh, sw);
+                    cells.push(Cell {
+                        d: rr.map(|t| t.0),
+                        mis: rr.map_or(1.0, |t| t.1),
+                        xb,
+                        hgt,
+                    });
+                }
+                // 低失配字的众数字高 → 同高过滤（排除 EXP 标签/实心底条）。
+                let low_h: Vec<i32> = cells
+                    .iter()
+                    .filter(|c| c.d.is_some() && c.mis <= MIS_MAX)
+                    .map(|c| c.hgt)
+                    .collect();
+                if low_h.is_empty() {
+                    gs = gi + 1;
+                    continue;
+                }
+                let hmed = mode(&low_h);
+                let tol = 0.2 * hmed as f32;
+                // 连续满足 ok 的字 = 值字段（允许单字，如 0）。
+                let mut segs: Vec<Vec<&Cell>> = Vec::new();
+                let mut seg: Vec<&Cell> = Vec::new();
+                for c in cells.iter() {
+                    let ok = c.d.is_some()
+                        && c.mis <= MIS_MAX
+                        && ((c.hgt - hmed) as f32).abs() <= tol;
+                    if ok {
+                        seg.push(c);
+                    } else if !seg.is_empty() {
+                        segs.push(std::mem::replace(&mut seg, Vec::new()));
+                    }
+                }
+                if !seg.is_empty() {
+                    segs.push(seg);
+                }
+                for s in segs {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    let ds: String = s.iter().map(|c| (b'0' + c.d.unwrap()) as char).collect();
+                    let len = ds.len() as i32;
+                    let right = s.last().unwrap().xb;
+                    let avg: f32 = s.iter().map(|c| c.mis).sum::<f32>() / s.len() as f32;
+                    if let Some(val) = ds.parse::<i64>().ok() {
+                        let key = (thr, -len, -right, avg);
+                        let better = match &best {
+                            None => true,
+                            Some((bk, _)) => key_better(&key, bk),
+                        };
+                        if better {
+                            best = Some((key, val));
+                        }
+                    }
+                }
+                gs = gi + 1;
+            }
+        }
+    }
+    best.map(|(_, v)| v)
 }
 
 // ---------------------------------------------------------------------------
