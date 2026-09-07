@@ -1,12 +1,12 @@
 //! mxd-bar 应用主体：一个置顶、无边框、透明的悬浮卡片。
 //!
-//! 主卡固定 72px 高、固定 `BAR_W`(=680px) 宽；当某页打开（上报数据 / 999打卡·神秘商人·BOSS
+//! 主卡固定 72px 高、固定 `BAR_W`(=860px) 宽；当某页打开（上报数据 / 999打卡·神秘商人·BOSS
 //! 的时分选择）时，卡片在**同一窗口**内向下方平滑展开，页面内容滑出在主卡下方（不再是
 //! 独立弹框，主卡也始终可见）。高度按页面实际内容自动适配（测量后动画趋近）；**宽度固定**，
 //! 内部的数字/倒计时等 live 文案在各自固定区域内自适应（居中，必要时缩小字号），
 //! 因此外框宽度不会随内容长短抖动。
 //!
-//! 布局：主卡从左到右 —— ①实时EXP/分 ②预估EXP/时 ③心电区 ④按钮区 ⑤工具列
+//! 布局：主卡从左到右 —— ①实时EXP/分 ②预估EXP/时 ③测试时间 ④累计经验 ⑤心电区 ⑥按钮区 ⑦工具列
 //! 心电区画近 1 分钟"每 5s 净增 EXP"相对该分钟均值的波动折线（见 paint_wave）。
 //! 按钮区分两行（上报数据/管理数据/BOSS、神秘商人/999打卡），其中只有「上报数据」
 //! 是橘黄重点按钮；最右是两枚小工具图标（无边框、各占一行）——上：退出 X；下：
@@ -26,13 +26,14 @@ use egui::{
 use crate::state::{ExpMetrics, Page, PickState, Shared, TimePickKind, SPARK_BUCKETS};
 use crate::theme::Palette;
 use crate::ui::{pickers, report};
-use crate::util::{thousands, TimerUi};
+use crate::util::{fmt_clock, thousands, TimerUi};
 
 /// 卡片总高（逻辑像素）。
 pub const BAR_HEIGHT: f32 = 72.0;
 
-/// 主卡固定总宽（逻辑像素）。外框恒定、内部文案自适应（用户 2026-09-04 定稿：写死约 680）。
-pub const BAR_W: f32 = 680.0;
+/// 主卡固定总宽（逻辑像素）。外框恒定、内部文案自适应。用户 2026-09-07 起加「测试时间」「累计经验」
+/// 两列后由 ~680 加宽到 ~860（四个指标列等宽，每列约 109px）。
+pub const BAR_W: f32 = 860.0;
 /// 首次创建窗口的占位宽度（首帧后即按 BAR_W 修正）。
 pub(crate) const INITIAL_WIDTH: f32 = BAR_W;
 
@@ -56,6 +57,8 @@ const EXIT_W: f32 = 48.0;
 const EXIT_GAP: f32 = 8.0;
 /// 单个指标列的最低宽度（防止按钮区过宽把指标区挤没了）。
 const METRIC_MIN_W: f32 = 78.0;
+/// 指标列个数：实时EXP/分 ｜ 预估EXP/时 ｜ 测试时间 ｜ 累计经验（等宽均分剩余宽度）。
+const METRIC_N: usize = 4;
 /// 心电区固定宽（用户 2026-09-04 定稿：预估列后 ~70px）。画近 1 分钟的"每 5s 经验波动"。
 const WAVE_W: f32 = 70.0;
 
@@ -119,6 +122,10 @@ impl Action {
 pub struct BarData {
     pub exp_min: String,
     pub exp_hour: String,
+    /// 测试时间：窗内采样条数 × 5s（与上报 test_seconds 同算法），时钟式格式。无样本显示 `-`。
+    pub test_time: String,
+    /// 累计经验：当前段（自刷新/升级起）最新 EXP − 段起点 EXP。无样本显示 `-`。
+    pub exp_cum: String,
     /// 近 1 分钟逐 5s 净增 EXP（心电图数据源）。无样本时 None → 不画心电图。
     pub spark: Option<[i64; SPARK_BUCKETS]>,
     pub punch: TimerUi,
@@ -168,6 +175,20 @@ impl MxdBarApp {
                 } else {
                     "-".to_owned()
                 },
+                // 测试时间：同上报 test_seconds 算法（窗内采样条数 × 5s），时钟式格式。
+                test_time: if g.exp.n_hour > 0 {
+                    fmt_clock(
+                        g.exp.n_hour as i64 * crate::sensor::sampler::SAMPLE_INTERVAL_SECS as i64,
+                    )
+                } else {
+                    "-".to_owned()
+                },
+                // 累计经验（当前段净获）：无样本 / 被清空显示 `-`，与其它指标一致。
+                exp_cum: if g.exp.n_hour > 0 {
+                    thousands(g.exp.cum_gain)
+                } else {
+                    "-".to_owned()
+                },
                 // 无样本（含启动/清空后）不画心电图。
                 spark: (g.exp.n_hour > 0).then_some(g.exp.spark),
                 punch: crate::util::punch_view(now, g.cfg.punch),
@@ -196,10 +217,24 @@ impl MxdBarApp {
                 .size()
         };
 
-        // —— 指标区标签（宽度恒定：只跟固定文案与字号有关）——
-        let label_1 = "实时EXP/分";
-        let label_2 = "预估EXP/时";
-        let (l1, l2) = (measure(label_1, &font_label), measure(label_2, &font_label));
+        // —— 指标区：4 个"标签在上、数值在下"的等宽列，标签/取值/取色一一对应 ——
+        let labels = ["实时EXP/分", "预估EXP/时", "测试时间", "累计经验"];
+        let val_strs = [
+            data.exp_min.as_str(),
+            data.exp_hour.as_str(),
+            data.test_time.as_str(),
+            data.exp_cum.as_str(),
+        ];
+        let val_colors = [
+            pal.exp_per_min,
+            pal.exp_per_hour,
+            pal.test_time,
+            pal.exp_cum,
+        ];
+        let mut lsz = [egui::Vec2::ZERO; METRIC_N];
+        for i in 0..METRIC_N {
+            lsz[i] = measure(labels[i], &font_label); // 标签宽度恒定：只跟固定文案与字号有关
+        }
 
         // —— 按钮区：两行靠左排布、右端对齐（窄行的按钮拉宽补足，见 cells_w）。
         // 排版基准用"每种按钮可能的最宽文案"（sizing_text）→ 每帧量出的宽度恒定，
@@ -240,37 +275,51 @@ impl MxdBarApp {
         let btns_top = (BAR_HEIGHT - btns_h) * 0.5;
 
         // —— 指标列宽：由固定总宽 BAR_W 反推（宽度恒定，不随数值位数变）。
-        // 总宽 = 2*PAD_X + 2*col_w + WAVE_W + 6*COL_GAP(三处分隔线槽) + btns_w + EXIT_GAP + EXIT_W。
-        let col_w = ((BAR_W - 2.0 * PAD_X - 6.0 * COL_GAP - WAVE_W - btns_w - EXIT_GAP - EXIT_W)
-            * 0.5)
+        // 总宽 = 2*PAD_X + METRIC_N*col_w + WAVE_W + 2*COL_GAP*(METRIC_N+1)（分隔线槽：
+        // 列间 METRIC_N-1 条 + 末列↔心电 1 条 + 心电↔按钮 1 条）+ btns_w + EXIT_GAP + EXIT_W。
+        let div_slots = (METRIC_N + 1) as f32;
+        let col_w = ((BAR_W - 2.0 * PAD_X - 2.0 * COL_GAP * div_slots - WAVE_W - btns_w - EXIT_GAP - EXIT_W)
+            / METRIC_N as f32)
             .max(METRIC_MIN_W)
             .floor();
 
         // —— 指标数值：字号收敛到列宽内完整放下（默认 20px；数字过长自动缩小，宽度不受影响）——
         let max_val_w = col_w - COLPAD;
-        let font_v1 = fit_font(&painter, &data.exp_min, &font_value, max_val_w);
-        let font_v2 = fit_font(&painter, &data.exp_hour, &font_value, max_val_w);
-        let (v1, v2) = (measure(&data.exp_min, &font_v1), measure(&data.exp_hour, &font_v2));
+        let mut vfont: [FontId; METRIC_N] = std::array::from_fn(|_| font_value.clone());
+        let mut vsz = [egui::Vec2::ZERO; METRIC_N];
+        for i in 0..METRIC_N {
+            vfont[i] = fit_font(&painter, val_strs[i], &font_value, max_val_w);
+            vsz[i] = measure(val_strs[i], &vfont[i]);
+        }
 
-        let content_h = l1.y.max(l2.y) + VAL_GAP + v1.y.max(v2.y);
+        let label_h = lsz.iter().map(|s| s.y).fold(0.0, f32::max);
+        let value_h = vsz.iter().map(|s| s.y).fold(0.0, f32::max);
+        let content_h = label_h + VAL_GAP + value_h;
         let content_top = ((BAR_HEIGHT - content_h) * 0.5).max(4.0);
 
-        // —— 横向坐标：指标区 / 分隔线 / 指标区 / 分隔线 / 心电区 / 分隔线 / 按钮区 / 工具列 ——
-        let x = bar.left() + PAD_X;
-        let z1 = Rect::from_min_size(pos2(x, bar.top()), vec2(col_w, BAR_HEIGHT));
-        let d1 = z1.right() + COL_GAP; // 分隔线1（居中于自己的间隙槽）
-        let z2 = Rect::from_min_size(pos2(d1 + COL_GAP, bar.top()), vec2(col_w, BAR_HEIGHT));
-        let d2 = z2.right() + COL_GAP; // 分隔线2
-        let wave_rect = Rect::from_min_size(pos2(d2 + COL_GAP, bar.top()), vec2(WAVE_W, BAR_HEIGHT));
-        let d3 = wave_rect.right() + COL_GAP; // 分隔线3（心电区 / 按钮区之间）
-        let btns_left = d3 + COL_GAP;
+        // —— 横向坐标：METRIC_N 个指标列（列间各一条分隔线）→ 心电区 → 按钮区 → 工具列 ——
+        let mut cols = [Rect::ZERO; METRIC_N];
+        let mut divs = [0.0f32; METRIC_N + 1];
+        let mut cursor = bar.left() + PAD_X;
+        for i in 0..METRIC_N {
+            cols[i] = Rect::from_min_size(pos2(cursor, bar.top()), vec2(col_w, BAR_HEIGHT));
+            cursor = cols[i].right() + COL_GAP;
+            divs[i] = cursor; // 分隔线（居中于自己的间隙槽）
+            cursor += COL_GAP;
+        }
+        let wave_rect = Rect::from_min_size(pos2(cursor, bar.top()), vec2(WAVE_W, BAR_HEIGHT));
+        cursor = wave_rect.right() + COL_GAP;
+        divs[METRIC_N] = cursor; // 心电区 / 按钮区 分隔线
+        cursor += COL_GAP;
+        let btns_left = cursor;
         let exit_left = btns_left + btns_w + EXIT_GAP;
         // 总宽固定（外框以 BAR_W 为准）。
         let total_w = BAR_W;
 
         // —— 指标区文字 ——
-        paint_metric(&painter, &z1, content_top, &l1, label_1, font_label.clone(), &v1, &data.exp_min, font_v1.clone(), pal.label, pal.exp_per_min);
-        paint_metric(&painter, &z2, content_top, &l2, label_2, font_label.clone(), &v2, &data.exp_hour, font_v2.clone(), pal.label, pal.exp_per_hour);
+        for i in 0..METRIC_N {
+            paint_metric(&painter, &cols[i], content_top, &lsz[i], labels[i], font_label.clone(), &vsz[i], val_strs[i], vfont[i].clone(), pal.label, val_colors[i]);
+        }
 
         // —— 心电区：近 1 分钟"每 5s 净增 EXP"相对该分钟均值的波动折线（无样本不画）——
         if let Some(gains) = data.spark {
@@ -281,9 +330,9 @@ impl MxdBarApp {
         let div_top = bar.top() + 12.0;
         let div_bot = bar.bottom() - 12.0;
         let div_stroke = Stroke::new(1.0, pal.divider);
-        painter.line_segment([pos2(d1, div_top), pos2(d1, div_bot)], div_stroke);
-        painter.line_segment([pos2(d2, div_top), pos2(d2, div_bot)], div_stroke);
-        painter.line_segment([pos2(d3, div_top), pos2(d3, div_bot)], div_stroke);
+        for &dx in &divs {
+            painter.line_segment([pos2(dx, div_top), pos2(dx, div_bot)], div_stroke);
+        }
 
         // —— 交互 ——
         // 先注册"整条拖动"（只主卡带可拖动，抽屉内容不抢）：按住空白处拖动窗口。

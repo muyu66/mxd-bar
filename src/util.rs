@@ -32,6 +32,19 @@ pub fn humanize_down(secs: i64) -> String {
     }
 }
 
+/// 秒数 → 时钟式显示（随大小升格）：`33s` → `1:05` → `1:00:00`。
+/// <60s 带 `s` 后缀；≥60s 为 `M:SS`；≥1h 为 `H:MM:SS`（主卡"测试时间"）。
+pub fn fmt_clock(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    } else {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 三个计时按钮的显示状态（输入 now，便于测试）
 // ---------------------------------------------------------------------------
@@ -154,6 +167,22 @@ mod tests {
         assert_eq!(humanize_down(22 * 60), "22m");
         assert_eq!(humanize_down(2 * 3600), "2h");
         assert_eq!(humanize_down(12 * 3600 + 300), "12h");
+    }
+
+    #[test]
+    fn clock_scales_units() {
+        // <60s：纯秒带 s 后缀
+        assert_eq!(fmt_clock(0), "0s");
+        assert_eq!(fmt_clock(5), "5s");
+        assert_eq!(fmt_clock(59), "59s");
+        // ≥1min：分:秒
+        assert_eq!(fmt_clock(60), "1:00");
+        assert_eq!(fmt_clock(65), "1:05");
+        assert_eq!(fmt_clock(3599), "59:59");
+        // ≥1h：时:分:秒
+        assert_eq!(fmt_clock(3600), "1:00:00");
+        assert_eq!(fmt_clock(3665), "1:01:05");
+        assert_eq!(fmt_clock(7200 + 123), "2:02:03");
     }
 
     // —— 计时显示 ——

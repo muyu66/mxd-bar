@@ -103,7 +103,7 @@ fn draw_form(ui: &mut egui::Ui, g: &mut Shared, close: &mut bool, kick: &mut Opt
                         .hint_text("搜索或直填"),
                 );
             });
-            let label = if magic { "魔法力" } else { "攻击力" };
+            let label = if magic { "魔法力" } else { "最大攻击力" };
             form_cell(row, ws[3], label, |c| {
                 c.add(
                     TextEdit::singleline(&mut g.report.power)
@@ -260,7 +260,7 @@ fn build_payload(g: &mut Shared) -> Result<ReportPayload, String> {
             {
                 "魔法力"
             } else {
-                "攻击力"
+                "最大攻击力"
             };
             return Err(format!("{label} 需为 ≥1 的正整数"));
         }

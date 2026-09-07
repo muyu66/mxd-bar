@@ -31,6 +31,10 @@ pub struct Palette {
     pub exp_per_min: Color32,
     /// “预估EXP/时” 数值颜色
     pub exp_per_hour: Color32,
+    /// “测试时间” 数值颜色
+    pub test_time: Color32,
+    /// “累计经验” 数值颜色
+    pub exp_cum: Color32,
     /// 主卡"心电图"折线颜色（相对均值波动）。
     pub wave: Color32,
     /// 心电图中线（0 = 窗口均值）的颜色，比折线淡。
@@ -71,6 +75,9 @@ impl Palette {
             label: Color32::from_rgba_unmultiplied(148, 165, 200, 255),
             exp_per_min: Color32::from_rgb(110, 226, 255),
             exp_per_hour: ORANGE,
+            // 测试时间：淡堇紫（区别于 实时/预估 的青与橘）。累计经验：成功绿，呼应"增长"。
+            test_time: Color32::from_rgb(196, 181, 253),
+            exp_cum: SUCCESS,
             // 心电图：折线用淡绿，中线再淡一档（表达"0 = 这 1 分钟的均值"）。
             wave: Color32::from_rgb(120, 222, 172),
             wave_axis: Color32::from_rgba_unmultiplied(120, 222, 172, 70),

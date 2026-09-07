@@ -135,19 +135,21 @@ pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
     let mut recs: VecDeque<Sample> = VecDeque::with_capacity(730);
     // 判定升级用的"连续低于原平均"缓冲（尚未确认，先不记入 recs）。
     let mut pending: Vec<Sample> = Vec::with_capacity(LEVELUP_RUN);
+    // 当前"段"的起点（累计经验/测试基准）：点刷新或升级时重置；独立于 recs，1h 剪除不影响它。
+    let mut base: Option<Sample> = None;
 
     // 连续未读到数据的次数；连续 MISS_LIMIT 次(≈20s)后才清掉旧数值显示 `-`。
     let mut miss: u32 = 0;
     let mut pc = PauseClock::new();
     while !stop.load(Ordering::Relaxed) {
         let t0 = Instant::now();
-        drain_clear(&shared, &mut recs, &mut pending, &mut miss);
-        tick(&shared, &mut recs, &mut pending, &mut miss, &mut pc, t0);
+        drain_clear(&shared, &mut recs, &mut pending, &mut miss, &mut base);
+        tick(&shared, &mut recs, &mut pending, &mut miss, &mut pc, &mut base, t0);
         // 剩余时间分段睡，stop 能及时打断（最长 100ms 响应）。
         let mut waited = t0.elapsed();
         while waited < SAMPLE_INTERVAL && !stop.load(Ordering::Relaxed) {
             // 清空请求不等到下一 tick（否则暂停/无游戏时最长要 5s 才生效）。
-            drain_clear(&shared, &mut recs, &mut pending, &mut miss);
+            drain_clear(&shared, &mut recs, &mut pending, &mut miss, &mut base);
             let step = (SAMPLE_INTERVAL - waited).min(Duration::from_millis(100));
             std::thread::sleep(step);
             waited = t0.elapsed();
@@ -156,12 +158,13 @@ pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
 }
 
 /// 消费 UI 的"清空经验采样队列"请求（主卡刷新图标）。命中后清掉已积累的样本链、
-/// 升级观望缓冲与连续失败计数，并把读数置回 `-`（无样本 → n_hour==0）。
+/// 升级观望缓冲与连续失败计数，并把读数置回 `-`（无样本 → n_hour==0）。段起点一并重置。
 fn drain_clear(
     shared: &Arc<Mutex<Shared>>,
     recs: &mut VecDeque<Sample>,
     pending: &mut Vec<Sample>,
     miss: &mut u32,
+    base: &mut Option<Sample>,
 ) {
     let mut g = shared.lock().unwrap();
     if !g.clear_queue {
@@ -172,6 +175,7 @@ fn drain_clear(
     drop(g); // 本地缓冲只有本线程会碰，放锁后再清，减少持锁时间
     recs.clear();
     pending.clear();
+    *base = None;
     *miss = 0;
 }
 
@@ -184,6 +188,7 @@ fn tick(
     pending: &mut Vec<Sample>,
     miss: &mut u32,
     pc: &mut PauseClock,
+    base: &mut Option<Sample>,
     now_real: Instant,
 ) {
     let wall = pc.step(now_real);
@@ -237,6 +242,9 @@ fn tick(
     };
     *miss = 0; // 成功读到数据 → 连续失败计数归零
     let accept = accept_exp(recs, pending, now, exp_now);
+    // 推进"段起点"并算累计经验（最新 EXP − 段起点；升级/刷新会重置段起点，见 next_base）。
+    *base = next_base(accept, recs, *base);
+    let cum = cum_gain(recs, *base);
     #[cfg(debug_assertions)]
     let note = match accept {
         Accept::Recorded => "",
@@ -255,6 +263,7 @@ fn tick(
         level: None,
         updated: Some(Instant::now()),
         spark: spark_gains(recs, now),
+        cum_gain: cum,
     };
     g.sampler.state = SamplerState::Running;
     g.sampler.msg = match accept {
@@ -336,6 +345,21 @@ fn prune(recs: &mut VecDeque<Sample>, now: Instant) {
         }
         recs.pop_front();
     }
+}
+
+/// 一段采样后推进"段起点"（累计经验的分母）：升级判定已把链重置成单条低值锚点 → 以它为起点；
+/// 否则保持已有起点；还没有起点（启动 / 点刷新之后）且记下了样本 → 以首条样本为段首。
+/// 段起点独立于样本链保存，`prune` 丢弃老样本不会挪动它，长会话（>1h）累计不截断。
+fn next_base(accept: Accept, recs: &VecDeque<Sample>, base: Option<Sample>) -> Option<Sample> {
+    match accept {
+        Accept::LevelUp => recs.back().copied(),
+        _ => base.or_else(|| recs.front().copied()),
+    }
+}
+
+/// 累计经验 = 当前最新 EXP − 段起点 EXP（段内单调递增，理论非负）。
+fn cum_gain(recs: &VecDeque<Sample>, base: Option<Sample>) -> i64 {
+    base.and_then(|b| recs.back().map(|l| l.exp.saturating_sub(b.exp).max(0))).unwrap_or(0)
 }
 
 /// 取时间窗内首尾两点的平均速率 (EXP/秒) 与窗内样本条数。
@@ -913,5 +937,78 @@ mod tests {
         let s = spark_gains(&recs, base + Duration::from_secs(65));
         assert_eq!(&s[0..8], &[0; 8], "最早 8 个桶在首个样本前，应为 0");
         assert_eq!(&s[8..], &[500; 4], "进入有数据区间后每桶=500");
+    }
+
+    // —— 累计经验（段起点 + 不随 1h 剪除）——
+
+    #[test]
+    fn base_starts_at_first_sample_and_cum_grows() {
+        let now = Instant::now();
+        let mut recs = VecDeque::new();
+        let mut pend = Vec::new();
+        let mut base = None;
+        let a1 = accept_exp(&mut recs, &mut pend, now - Duration::from_secs(10), 1000);
+        assert_eq!(a1, Accept::Recorded);
+        base = next_base(a1, &recs, base);
+        assert_eq!(base.map(|b| b.exp), Some(1000), "段首 = 第一条样本");
+        assert_eq!(cum_gain(&recs, base), 0);
+        let a2 = accept_exp(&mut recs, &mut pend, now - Duration::from_secs(5), 1100);
+        assert_eq!(a2, Accept::Recorded);
+        base = next_base(a2, &recs, base);
+        assert_eq!(cum_gain(&recs, base), 100);
+        let a3 = accept_exp(&mut recs, &mut pend, now, 1300);
+        base = next_base(a3, &recs, base);
+        assert_eq!(cum_gain(&recs, base), 300);
+    }
+
+    #[test]
+    fn levelup_rebases_and_cum_restarts() {
+        let now = Instant::now();
+        let mut recs = plateau(now, 1_000_000, 0); // 平台：均值=末值=1,000,000
+        let base_old = recs.front().copied(); // 旧段起点（最老样本）
+        let mut base = base_old;
+        let mut pend = Vec::new();
+        assert_eq!(accept_exp(&mut recs, &mut pend, now, 3000), Accept::Ignored);
+        assert_eq!(
+            accept_exp(&mut recs, &mut pend, now + Duration::from_secs(5), 3100),
+            Accept::Ignored
+        );
+        let r3 = accept_exp(&mut recs, &mut pend, now + Duration::from_secs(10), 3200);
+        assert_eq!(r3, Accept::LevelUp);
+        assert_eq!(recs.len(), 1, "升级后旧段作废，只留新起点");
+        base = next_base(r3, &recs, base);
+        assert_eq!(base.map(|b| b.exp), Some(3200), "升级后段起点应更新为新锚点");
+        assert_eq!(cum_gain(&recs, base), 0);
+        // 新等级再记一条：累计只算新等级增量，不含旧等级。
+        let r4 = accept_exp(&mut recs, &mut pend, now + Duration::from_secs(15), 3700);
+        assert_eq!(r4, Accept::Recorded);
+        base = next_base(r4, &recs, base);
+        assert_eq!(cum_gain(&recs, base), 500);
+    }
+
+    #[test]
+    fn cum_gain_ignores_hourly_prune() {
+        let now = Instant::now();
+        // 2 小时匀速：k 1..=1440，每 5s +500，最早样本 exp=500，最新 exp=720,000。
+        let mut recs = VecDeque::new();
+        for k in 1..=1440 {
+            let t = now - Duration::from_secs((1440 - k) as u64 * 5);
+            recs.push_back(Sample {
+                at: t,
+                exp: 500 * k as i64,
+            });
+        }
+        let base = recs.front().copied(); // 段起点 = 全程最早样本
+        let full_gain = cum_gain(&recs, base); // ≈720,000 − 500
+        prune(&mut recs, now); // 1h 剪除：front 前移到 ~1h 前
+        assert!(
+            recs.front().unwrap().exp > base.unwrap().exp,
+            "老样本应被剪除"
+        );
+        // 段起点保持最老锚点不变 → 累计仍 = 全程净获
+        assert_eq!(cum_gain(&recs, base), full_gain, "累计不应随 1h 剪除回退");
+        // 若按剪除后链首尾差则不足全程（说明确实需要独立段起点）
+        let window_gain = recs.back().unwrap().exp - recs.front().unwrap().exp;
+        assert!(window_gain < full_gain);
     }
 }

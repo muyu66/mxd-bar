@@ -58,6 +58,9 @@ pub struct ExpMetrics {
     /// 近 1 分钟逐 5s 净增 EXP（`SPARK_BUCKETS` 点，最新在末尾）——主卡"心电图"数据源。
     /// 无样本 / 被清空时全 0；UI 在 `n_hour==0` 时隐藏整条心电图。
     pub spark: [i64; SPARK_BUCKETS],
+    /// 累计经验：当前"段"（自最近一次 刷新/升级 起）最新 EXP − 段起点 EXP。
+    /// 段起点独立于样本链保留、不受 1h 剪除影响，因此长会话（>1h）也持续累计。
+    pub cum_gain: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
