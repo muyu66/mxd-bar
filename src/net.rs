@@ -62,6 +62,11 @@ pub fn api_base(cfg: &AppConfig) -> &'static str {
     }
 }
 
+/// 官网地址（「关于」页展示/点开用）。即生产服务端基址——联调模式下官网也照指生产站。
+pub fn official_site() -> &'static str {
+    PROD_BASE
+}
+
 /// 是否正在走本地基址（用于 `--nettest` 等只限本地操作的防护；仅 debug 用）。
 #[cfg(debug_assertions)]
 pub fn local_enabled(cfg: &AppConfig) -> bool {

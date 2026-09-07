@@ -1,10 +1,8 @@
-//! 999打卡 / 神秘商人 / BOSS 共用的"时分选择"（抽屉内页面）。
+//! 999打卡 / BOSS 共用的"时分选择"（抽屉内页面）。
 //!
-//! 与上报页一样画在主卡下方的抽屉里，主卡保持可见。三种类型只是"确定后写进 cfg 的
+//! 与上报页一样画在主卡下方的抽屉里，主卡保持可见。两种类型只是"确定后写进 cfg 的
 //! 字段"不同，编辑缓冲统一放在 `Shared.pick`：
 //! - Punch：一次性"下一个 HH:MM"打卡目标（带日期，过点变红待打卡）。
-//! - Merchant：循环周期时长（时分，如 05:59 = 每 5h59m 一轮），确定时刻记为锚点；
-//!   未设定（无锚点）时卡片显示"无"。
 //! - Boss：秒表起算时刻（带日期，超过 99 分钟自动作废）。
 //!
 //! 页面就一行：左边 时分输入(HH : MM)，右边 确定(橘黄)/取消；不放标题/提示/预览文字。
@@ -90,11 +88,6 @@ fn apply(shared: &Arc<Mutex<Shared>>, kind: TimePickKind) {
             // 这样到点后（红色待打卡）再次点确定，就会自动滚到下一天同一时分，红色清除。
             let nxt = crate::util::next_occurrence(now, t);
             g.cfg.punch = Some((nxt.date(), nxt.time()));
-        }
-        TimePickKind::Merchant => {
-            // 商人：记录周期时长 + 以“本次确定”为新锚点 → 立刻从这个时长开始循环倒数。
-            g.cfg.merchant_time = Some(t);
-            g.cfg.merchant_ref = Some(now);
         }
         TimePickKind::Boss => {
             // BOSS：正向秒表，记录当天的设定时分，从该时刻累计（现在时分 − 记录时分）。

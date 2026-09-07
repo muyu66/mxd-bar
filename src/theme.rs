@@ -11,7 +11,7 @@ pub const ORANGE: Color32 = Color32::from_rgb(255, 152, 51);
 /// 深橘黄实心底：白字压在橘黄上的大面积底色（选中态 / 重点按钮实心）用这个。
 /// 白字对比约 4.8:1，不像亮橘（~2.1:1）那样发糊刺眼；橘黄纯文字仍用 `ORANGE`。
 pub const ORANGE_DEEP: Color32 = Color32::from_rgb(180, 83, 9);
-/// 成功/已刷新绿。
+/// 成功/正向绿。
 pub const SUCCESS: Color32 = Color32::from_rgb(92, 235, 150);
 /// 危险/待打卡红。
 pub const DANGER: Color32 = Color32::from_rgb(255, 96, 96);
@@ -54,8 +54,6 @@ pub struct Palette {
     pub prim_hover: Color32,
     pub prim_active: Color32,
     pub prim_border: Color32,
-    /// 成功/已刷新（商人）
-    pub success: Color32,
     /// 危险/待打卡（999 过点）
     pub danger: Color32,
 }
@@ -92,7 +90,6 @@ impl Palette {
             prim_hover: Color32::from_rgb(204, 104, 14),
             prim_active: Color32::from_rgb(150, 66, 8),
             prim_border: Color32::from_rgba_unmultiplied(255, 180, 100, 140),
-            success: SUCCESS,
             danger: DANGER,
         }
     }

@@ -1,17 +1,33 @@
 //! mxd-bar 应用主体：一个置顶、无边框、透明的悬浮卡片。
 //!
-//! 主卡固定 72px 高、固定 `BAR_W`(=860px) 宽；当某页打开（上报数据 / 999打卡·神秘商人·BOSS
-//! 的时分选择）时，卡片在**同一窗口**内向下方平滑展开，页面内容滑出在主卡下方（不再是
+//! 主卡固定 72px 高、固定 `BAR_W`(=872px) 宽；当某页打开（上报数据 / 999打卡·BOSS
+//! 的时分选择 / EXP 日志 / 关于）时，卡片在**同一窗口**内向下方平滑展开，页面内容滑出在主卡下方（不再是
 //! 独立弹框，主卡也始终可见）。高度按页面实际内容自动适配（测量后动画趋近）；**宽度固定**，
 //! 内部的数字/倒计时等 live 文案在各自固定区域内自适应（居中，必要时缩小字号），
 //! 因此外框宽度不会随内容长短抖动。
 //!
-//! 布局：主卡从左到右 —— ①实时EXP/分 ②预估EXP/时 ③测试时间 ④累计经验 ⑤心电区 ⑥按钮区 ⑦工具列
+//! 布局：主卡从左到右 —— ①实时EXP/分 ②预估EXP/时 ③测试时间 ④累计经验 ⑤心电区 ⑥按钮区 ⑦工具格
 //! 心电区画近 1 分钟"每 5s 净增 EXP"相对该分钟均值的波动折线（见 paint_wave）。
-//! 按钮区分两行（上报数据/管理数据/BOSS、神秘商人/999打卡），其中只有「上报数据」
-//! 是橘黄重点按钮；最右是两枚小工具图标（无边框、各占一行）——上：退出 X；下：
-//! 刷新 = 清空 实时/预估经验队列（采样从新样本重新累积）。
-//! 999/商人/BOSS 文本实时变化。数据源统一走 `Shared`（见 state.rs），本模块只读取与绘制。
+//! 按钮区分两行（上报数据/管理数据 / BOSS、999打卡），其中只有「上报数据」
+//! 是橘黄重点按钮；最右是 **2×2 工具格**（PNG 图标，见 icons.rs）：上行 日志 · 关闭，
+//! 下行 关于 · 重置（用户 2026-09-07 定稿：close 与 info 互换）。999/BOSS 文本实时变化。
+//! 数据源统一走 `Shared`（见 state.rs），
+//! 本模块只读取与绘制。
+//!
+//! 主卡有两种**布局模式**（config.rs `PanelMode`，**只作运行时态、不落盘**）：
+//! - `Normal` 常规：悬浮、可随意拖动；位置在拖动停稳后写回 ini。
+//! - `Auto` 收缩/展开：把常规卡片**拖动到屏幕顶部**松手即进入 —— 窗体立刻贴到顶部(y=0)、
+//!   收成一条细线。细线固定、**不可拖动**；鼠标悬停 → 展开成完整主卡；鼠标离开满 5s → 收回。
+//!   悬停展开态下可拖动卡片：**拖离屏幕顶部松手 = 切回常规**（停在被拖到的位置）；仍贴着
+//!   顶部松手则留在 Auto（只是换了横位）。999 打卡转「待打卡」时，收线/展开的卡片描边红
+//!   色呼吸脉冲。
+//!
+//! **模式完全由"位置"推导**：ini `[panel]` 只记主卡**上次退出时的位置**（x/y，不含 mode）。
+//! 启动时 y 落在顶部吸附带(≤ `TOP_SNAP`)内 → 进入 Auto 贴顶收起；带外 → 常规悬浮、不吸附。
+//! 拖动松手也按最终落点进/出 Auto（见 `end_drag`）。因本窗口置顶/无边框/透明，
+//! 实测 OS 标题栏拖拽(`ViewportCommand::StartDrag`)拖不动窗体，故拖动是**自己每帧用
+//! `OuterPosition` 跟随光标**实现的（`drag_start`/`drag_follow`/`end_drag`），
+//! 落点始终精确已知、无 OS 模态拖拽的滞后问题。
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,17 +39,19 @@ use egui::{
     ViewportCommand,
 };
 
+use crate::config::PanelMode;
+use crate::icons::Icons;
 use crate::state::{ExpMetrics, Page, PickState, Shared, TimePickKind, SPARK_BUCKETS};
 use crate::theme::Palette;
-use crate::ui::{pickers, report};
+use crate::ui::{about, log, pickers, report};
 use crate::util::{fmt_clock, thousands, TimerUi};
 
 /// 卡片总高（逻辑像素）。
 pub const BAR_HEIGHT: f32 = 72.0;
 
-/// 主卡固定总宽（逻辑像素）。外框恒定、内部文案自适应。用户 2026-09-07 起加「测试时间」「累计经验」
-/// 两列后由 ~680 加宽到 ~860（四个指标列等宽，每列约 109px）。
-pub const BAR_W: f32 = 860.0;
+/// 主卡固定总宽（逻辑像素）。外框恒定、内部文案自适应。用户 2026-09-07 起最右工具列由单列
+/// 两枚图标改成 2×2 工具格后由 ~860 加宽到 ~872（四个指标列等宽，每列约 109px）。
+pub const BAR_W: f32 = 872.0;
 /// 首次创建窗口的占位宽度（首帧后即按 BAR_W 修正）。
 pub(crate) const INITIAL_WIDTH: f32 = BAR_W;
 
@@ -51,10 +69,12 @@ const BTN_PAD_X: f32 = 14.0; // 每个按钮横向额外留白(两侧合计)
 
 const CARD_RADIUS: u8 = 14;
 
-/// 最右工具列宽度（退出 X 与 刷新 图标各占其中一行，无边框/底色）。
-const EXIT_W: f32 = 48.0;
-/// 工具列与按钮区之间留的空隙。
-const EXIT_GAP: f32 = 8.0;
+// —— 最右 2×2 工具格（PNG 图标，icons.rs）——
+const ICON_C: f32 = 26.0; // 单格边长（方形，图标按格内接绘制）
+const ICON_GAP_X: f32 = 5.0; // 格内左右两列的列距
+const ICON_W: f32 = 2.0 * ICON_C + ICON_GAP_X; // 工具格总宽（行距不另设：两行居中于按钮两行，天然对齐）
+const RAIL_GAP: f32 = 8.0; // 工具格与按钮区之间留的空隙
+
 /// 单个指标列的最低宽度（防止按钮区过宽把指标区挤没了）。
 const METRIC_MIN_W: f32 = 78.0;
 /// 指标列个数：实时EXP/分 ｜ 预估EXP/时 ｜ 测试时间 ｜ 累计经验（等宽均分剩余宽度）。
@@ -76,26 +96,49 @@ const DRAWER_PAD_X: f32 = 22.0;
 /// 上下留白都由这里统一给，保证两页观感一致、不再顶边缩角。
 const DRAWER_MARGIN_Y: f32 = 14.0;
 
-/// 主卡片上的按钮动作。退出 X 与 刷新 不在按钮行里，单独画在最右的工具列（上/下各一行）。
+// —— 收缩/展开（Auto）模式的几何与节奏 ——
+/// 收成一条线时的高度（逻辑像素）。实测窗口贴近顶边后仍留有约 8px 的去不掉的透明余量，
+/// 只开 8px 会被它挤得几乎看不见，故整窗取 20 让收线有可见高度。
+const AUTO_STRIP_H: f32 = 20.0;
+/// 悬停展开后，鼠标离开窗口满这么久(秒)再收线。
+const AUTO_LEAVE: f64 = 5.0;
+/// 展开/收起高度动画趋近速率（指数趋近系数，值越大越跟手）。
+const AUTO_K: f32 = 16.0;
+/// "顶部吸附带"宽度（逻辑像素）：窗体左上角 y ≤ 此值即视为贴在屏幕顶部。
+/// 既是**拖动松手判进 Auto** 的阈值，也是**启动时据 ini 记的退出位置反推模式**的阈值——
+/// 上次退出 y 落进此带 → 启动即 Auto（贴顶收起）；带外 → 常规悬浮不吸附。
+/// 与收线高度 `AUTO_STRIP_H` 保持一致：收线本身就在这条带里，"拖到这条带"才算贴顶进 Auto，
+/// 进入后由贴顶逻辑吸到 y=0。
+const TOP_SNAP: f32 = 20.0;
+/// 收线高度到此仍算"线态"：≤ 此值给收线画经验进度条；再高是展开动画中途、只画底卡。
+/// 取 收线高 + 6，让收线/刚起手那几帧都覆盖到，又不至于占进展开卡的高度。
+const STRIP_WAVE_MAX: f32 = AUTO_STRIP_H + 6.0;
+/// 收线进度条长度缓动速率（指数趋近系数，越小收得越"软"，越大越跟手）。
+const METER_K: f32 = 6.0;
+
+/// 主卡片上的动作。Report..Boss 在按钮行里；Exit/Refresh/Log/About 走最右 2×2 工具格。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Report,
     Manage,
     Punch,
-    Merchant,
     Boss,
+    /// 关闭程序（工具格 close）。
     Exit,
-    /// 清空 实时/预估经验队列（刷新图标）。
+    /// 清空 实时/预估经验队列（工具格 reload）。
     Refresh,
+    /// 打开/收起 控制台式 EXP 日志页（工具格 debug）。
+    Log,
+    /// 打开/收起「关于」页：工具版本 + 官网（工具格 info）。
+    About,
 }
 
 impl Action {
-    /// 两行按钮（不含退出 X）。每行靠左排布，行宽各自适应。
-    /// BOSS 与 999打卡 互换了位置：第一行右列是 BOSS，第二行右列是 999打卡。
+    /// 两行按钮（不含工具格动作）。每行靠左排布，行宽各自适应。
     fn rows() -> Vec<Vec<Action>> {
         vec![
-            vec![Action::Report, Action::Manage, Action::Boss],
-            vec![Action::Merchant, Action::Punch],
+            vec![Action::Report, Action::Manage],
+            vec![Action::Boss, Action::Punch],
         ]
     }
 
@@ -105,10 +148,11 @@ impl Action {
             Action::Report => "上报数据",
             Action::Manage => "管理数据",
             Action::Punch => "999打卡",
-            Action::Merchant => "神秘商人",
             Action::Boss => "BOSS",
-            Action::Exit => "X",
-            Action::Refresh => "刷新",
+            Action::Exit => "关闭",
+            Action::Refresh => "重置",
+            Action::Log => "日志",
+            Action::About => "关于",
         }
     }
 
@@ -129,7 +173,6 @@ pub struct BarData {
     /// 近 1 分钟逐 5s 净增 EXP（心电图数据源）。无样本时 None → 不画心电图。
     pub spark: Option<[i64; SPARK_BUCKETS]>,
     pub punch: TimerUi,
-    pub merchant: TimerUi,
     pub boss: TimerUi,
 }
 
@@ -137,23 +180,254 @@ pub struct MxdBarApp {
     pub shared: Arc<Mutex<Shared>>,
     /// 窗口宽度是否已与内容对齐
     sized: bool,
-    /// 是否已把窗口放到屏幕顶部中央
+    /// 常规模式：是否已把窗口放到保存位置/顶部居中（Auto 的贴顶用自己的 pinned，见下）。
     positioned: bool,
     /// 首帧需安装中文字体 + 控件样式（需要 ctx，故延迟到 ui()）
     fonts_installed: bool,
     /// 当前抽屉展开高度（0=完全收起；动画逼近当页内容测得的高度）
     panel_h: f32,
+    /// 工具图标纹理（需要 ctx，首帧惰性加载；见 icons.rs）。
+    icons: Option<Icons>,
+    /// 布局模式：常规 / 收缩-展开。构造时由 ini 记忆的退出位置反推（y≤TOP_SNAP→Auto）；
+    /// 只作内存态，不进 ini。
+    mode: PanelMode,
+    // —— Auto（收缩/展开）运行时子状态 ——
+    /// 指针在窗内（悬停）= 展开；离开 = 待收线。
+    auto_open: bool,
+    /// 指针离开窗口的时刻（ctx.time）；离开满 AUTO_LEAVE 收线，期间回来即复位。
+    auto_leave_at: Option<f64>,
+    /// 当前高度（向 展开=BAR_HEIGHT / 收线=AUTO_STRIP_H 缓动）。
+    auto_h: f32,
+    /// Auto 段内贴顶的横向 x（= 进入 Auto 时的常规位置 x；首帧拿到显示器信息后定）。
+    auto_x: Option<f32>,
+    /// 本 Auto 段内是否已发过"贴到 (auto_x, 0)"的 OuterPosition（每个切换点复位一次）。
+    pinned: bool,
+    // —— 收线进度条 ——
+    /// 当前显示的长度比例（0..1，向"最新 5s 值/窗内动态最大"缓动，见 ui_auto / meter_frac）。
+    meter: f32,
+    // —— 手动拖动（自实现，见 drag_start/drag_follow/end_drag）——
+    /// 一次拖动进行中（bar 上 drag_started → drag_stopped）。期间 Auto 不贴顶、不收起。
+    dragging: bool,
+    /// 拖动开始那帧的抓取点（窗内坐标）。拖动中每帧把窗口"钉"在抓取点随光标走。
+    drag_grab: Option<egui::Pos2>,
+    /// 拖动开始那帧的窗体左上角（松手时比它位移 >1px 才算真拖动；只在 bar 上"点一下"不动 → 不吸附不收线）。
+    drag_origin: Option<egui::Pos2>,
+    // —— 常规模式位置心跳 ——
+    /// 上次写盘/记录的窗体左上角（逻辑像素）；None = 还没记录。
+    last_pos: Option<[f32; 2]>,
+    /// 上次心跳写盘的时刻（ctx.time），用于节流（≥0.8s 才写一次）。
+    last_save_at: Option<f64>,
 }
 
 impl MxdBarApp {
     pub fn new(shared: Arc<Mutex<Shared>>) -> Self {
+        // 模式不由 ini 存——由记忆的**退出位置**反推：上次退出 y 落在顶部吸附带内 → Auto
+        // 收起贴顶；带外 → 常规。（位置本身在首帧摆放处再读 cfg。）
+        let y = shared.lock().unwrap().cfg.panel_y;
+        // y<0 是"未记录"哨兵，天然不在 0..=TOP_SNAP 内。
+        let near_top = (0.0..=TOP_SNAP).contains(&y);
         Self {
             shared,
             sized: false,
             positioned: false,
             fonts_installed: false,
             panel_h: 0.0,
+            icons: None,
+            mode: if near_top { PanelMode::Auto } else { PanelMode::Normal },
+            auto_open: false,
+            auto_leave_at: None,
+            auto_h: if near_top { AUTO_STRIP_H } else { BAR_HEIGHT },
+            auto_x: None,
+            pinned: false,
+            meter: 0.0,
+            dragging: false,
+            drag_grab: None,
+            drag_origin: None,
+            last_pos: None,
+            last_save_at: None,
         }
+    }
+
+    /// 当前窗口外框左上角（egui 逻辑坐标）。Windows 下布局后即为 Some；最小化/初始化时可能为 None。
+    fn outer_min(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
+        ctx.input(|i| i.viewport().outer_rect).map(|r| r.min)
+    }
+
+    /// 进入 Auto（常规卡片拖到屏幕顶部松手 / 启动时位置本就在顶部带内）：关抽屉、把"退出位置"
+    /// 记成贴顶 (x, 0) 落盘、收成细线。`x` = 松手时的横位。
+    fn enter_auto(&mut self, ctx: &egui::Context, x: f32) {
+        {
+            let mut g = self.shared.lock().unwrap();
+            g.page = Page::None; // 收缩态不开抽屉
+            // ini 只记退出位置：贴在顶部的 (x, 0) → 下次启动据此再进 Auto。
+            g.cfg.panel_x = x;
+            g.cfg.panel_y = 0.0;
+            g.persist_cfg();
+        }
+        self.mode = PanelMode::Auto;
+        self.auto_open = false; // 先收线，等鼠标悬停再展开
+        self.auto_leave_at = None;
+        self.auto_h = AUTO_STRIP_H;
+        self.pinned = false; // 下一帧贴到顶部
+        self.auto_x = Some(x); // 直接用松手横位贴顶
+        self.panel_h = 0.0;
+        self.last_pos = None;
+        self.last_save_at = None;
+        ctx.request_repaint();
+    }
+
+    /// 退出 Auto 回常规（Auto 展开态点了开抽屉页等需常规态的动作）：把窗口挪到**吸附带外**
+    /// 的常规位置。顶部带内没法停常规卡——否则下帧随手一拖又判成"贴顶进 Auto"。优先用 ini 里
+    /// 记的位置；它若也落在带内（此前就是在 Auto 里退出、位置是贴顶 (x,0)），就下挪到 y=40
+    /// 给抽屉留出空间。模式不再落盘。
+    fn exit_auto_restore(&mut self, ctx: &egui::Context) {
+        self.mode = PanelMode::Normal;
+        self.auto_open = false;
+        self.auto_leave_at = None;
+        self.auto_h = BAR_HEIGHT;
+        self.pinned = false;
+        self.auto_x = None;
+        // 直接把窗口挪到带外的常规位置——若丢给常规分支等"尺寸稳定再首摆"，开抽屉时会先露
+        // 出贴在顶部的那一帧再跳走。拿不到显示器信息（极少）才退回常规分支的首摆兜底。
+        let (cfgx, cfgy) = {
+            let g = self.shared.lock().unwrap();
+            (g.cfg.panel_x, g.cfg.panel_y)
+        };
+        match ctx.input(|i| i.viewport().monitor_size) {
+            Some(mon) => {
+                let x = if cfgx >= 0.0 {
+                    cfgx
+                } else {
+                    ((mon.x - BAR_W) * 0.5).max(0.0)
+                };
+                // 常规卡绝不放进顶部吸附带（≤TOP_SNAP 的位置留给出 Auto 用）。
+                let y = if cfgy > TOP_SNAP { cfgy } else { 40.0 };
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(x, y)));
+                self.positioned = true; // 已亲自摆放，常规分支不再重摆
+                self.last_pos = Some([x, y]);
+                self.last_save_at = None;
+                self.persist_pos(x, y); // 记成新的"退出位置"
+            }
+            None => {
+                self.positioned = false;
+                self.sized = false;
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// 把窗体左上角写进 ini `[panel]`（唯一持久化的面板状态：退出位置）。
+    fn persist_pos(&mut self, x: f32, y: f32) {
+        let mut g = self.shared.lock().unwrap();
+        g.cfg.panel_x = x;
+        g.cfg.panel_y = y;
+        g.persist_cfg();
+    }
+
+    /// 拖动开始：记下抓取点（窗内坐标）与此刻窗位，由 `drag_follow` 每帧把窗口钉住抓取点随光标走。
+    fn drag_start(&mut self, ctx: &egui::Context) {
+        self.dragging = true;
+        self.drag_grab = ctx.pointer_latest_pos();
+        self.drag_origin = self.outer_min(ctx);
+        #[cfg(debug_assertions)]
+        eprintln!("[mxd-bar] 开始拖动卡片");
+        ctx.request_repaint();
+    }
+
+    /// 拖动中每帧：把窗口左上角挪到"让抓取点仍压在光标下"的位置。这是**位置伺服**而非位移
+    /// 累加——每次用 eframe 如实上报的当前窗位 outer_min 重新对准目标，丢帧/漏事件也不会漂移；
+    /// 落点也因此始终精确可知（end_drag 据此进/出 Auto）。
+    fn drag_follow(&mut self, ctx: &egui::Context) {
+        let Some(grab) = self.drag_grab else { return };
+        let Some(win) = self.outer_min(ctx) else { return };
+        let Some(p) = ctx.pointer_latest_pos() else { return };
+        let t = win + (p - grab);
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(
+            t.x.round().max(0.0),
+            t.y.round().max(0.0),
+        )));
+        ctx.request_repaint_after(Duration::from_millis(16)); // 拖动中持续跟上，别让光标甩出窗
+    }
+
+    /// 拖动松手：最后一次对准落点，然后**按最终位置**决定进/出 Auto——
+    /// - 落点落进顶部吸附带 → 进 Auto（贴顶收线；Auto 内横向换位松手也走这里，换横位保持 Auto）；
+    /// - 落在带外 → 常规：Auto 展开态拖离顶就停在这儿，常规态拖拽也就此停稳；把落点写回 ini
+    ///   作"退出位置"。
+    fn end_drag(&mut self, ctx: &egui::Context) {
+        if !self.dragging {
+            return;
+        }
+        self.dragging = false;
+        let grab = self.drag_grab.take();
+        let origin = self.drag_origin.take();
+        // 松手帧再对准一次（OuterPosition 帧末才生效，这里直接算出目标用于判定，不读滞后窗位）。
+        let mut final_pos: Option<egui::Pos2> = None;
+        if let (Some(g), Some(win), Some(p)) = (grab, self.outer_min(ctx), ctx.pointer_latest_pos()) {
+            let t = win + (p - g);
+            let t = pos2(t.x.round().max(0.0), t.y.round().max(0.0));
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(t));
+            final_pos = Some(t);
+        }
+        let m = final_pos.or_else(|| self.outer_min(ctx));
+        let Some(m) = m else { return };
+        // 只在 bar 上"点一下"（没真正位移）→ 不算拖动：Auto 不收线、不吸附，常规不落盘。
+        let moved = origin.is_none_or(|o| (o.x - m.x).abs() > 1.0 || (o.y - m.y).abs() > 1.0);
+        #[cfg(debug_assertions)]
+        if moved {
+            eprintln!("[mxd-bar] 拖动落点 y={:.1}（顶部吸附阈值 {}）", m.y, TOP_SNAP);
+        }
+        if !moved {
+            return;
+        }
+
+        if m.y <= TOP_SNAP {
+            // 落进顶部带（常规拖到顶 / Auto 内横向换位）→ 进 Auto 贴顶收起。
+            self.enter_auto(ctx, m.x);
+            return;
+        }
+        if self.mode == PanelMode::Auto {
+            // Auto 展开态被拖离顶 → 回常规，停在松手处；不再贴顶锁定。
+            self.mode = PanelMode::Normal;
+            self.auto_open = false;
+            self.auto_leave_at = None;
+            self.auto_h = BAR_HEIGHT;
+            self.pinned = false;
+            self.auto_x = None;
+        }
+        // 常规落点：已亲手摆好，常规分支首帧别再重摆；落点写回 ini 记作"退出位置"。
+        self.positioned = true;
+        self.last_pos = Some([m.x, m.y]);
+        self.last_save_at = None;
+        self.persist_pos(m.x, m.y);
+        ctx.request_repaint();
+    }
+
+    /// 常规位置心跳：窗体离上次记录 >0.5px 且距上次写盘 ≥0.8s 时，把落点写回 cfg 并落盘。
+    /// 常规模式拖动停稳后，下一帧就会走到这里记下最终位置（end_drag 也会立即写一次）。
+    fn heartbeat_save_pos(&mut self, ctx: &egui::Context) {
+        if self.mode != PanelMode::Normal || !self.positioned {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let Some(min) = self.outer_min(ctx) else { return };
+        let cur = [min.x, min.y];
+        let changed = match self.last_pos {
+            Some(p) => (p[0] - cur[0]).abs() > 0.5 || (p[1] - cur[1]).abs() > 0.5,
+            None => true,
+        };
+        if !changed {
+            return;
+        }
+        // 节流：写盘别太密。
+        if self.last_save_at.is_some_and(|t| now - t < 0.8) {
+            return;
+        }
+        self.last_pos = Some(cur);
+        self.last_save_at = Some(now);
+        let mut g = self.shared.lock().unwrap();
+        g.cfg.panel_x = cur[0];
+        g.cfg.panel_y = cur[1];
+        g.persist_cfg();
     }
 
     /// 取一帧绘制所需的当前页 + 全部显示值（一次加锁快照）。
@@ -192,10 +466,157 @@ impl MxdBarApp {
                 // 无样本（含启动/清空后）不画心电图。
                 spark: (g.exp.n_hour > 0).then_some(g.exp.spark),
                 punch: crate::util::punch_view(now, g.cfg.punch),
-                merchant: crate::util::merchant_view(now, g.cfg.merchant_time, g.cfg.merchant_ref),
                 boss: crate::util::boss_view(now, g.cfg.boss),
             },
         )
+    }
+
+    /// Auto（收缩/展开）这一帧：指针进出推进状态、贴顶固定、按 auto_open 展开/收线、画卡。
+    /// 不在主分支里做：Auto 不开抽屉页，只画 72px 主卡带（或收成 16px 细线）。
+    fn ui_auto(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, data: &BarData) {
+        let painter = ui.painter().clone();
+        let pal = Palette::dark();
+        let time = ctx.input(|i| i.time);
+
+        // —— 指针进出（事件驱动：PointerMoved=在窗内、PointerGone=离开窗口）——
+        // 用事件而非某控件 hovered()：既管收起态那条细线"悬停到即展开"，也避免指针停在
+        // 图标/按钮上时把"还在窗内"误判成"离开"。egui-winit 只在指针跨入/跨出窗口时给这两类
+        // 事件，因此在窗内静止不动不会误触发收线计时。
+        if self.dragging {
+            // 拖动中（Auto 展开态被抓住在拖）：始终保持在展开态，别因指针瞬时出窗/停顿而收线。
+            self.auto_open = true;
+            self.auto_leave_at = None;
+        }
+        let moved_in = ctx
+            .input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))));
+        let gone_out = ctx
+            .input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerGone)));
+        if moved_in {
+            self.auto_open = true;
+            self.auto_leave_at = None;
+        }
+        if gone_out && self.auto_leave_at.is_none() {
+            self.auto_leave_at = Some(time);
+        }
+        if self.auto_leave_at.is_some_and(|t0| time - t0 >= AUTO_LEAVE) {
+            self.auto_open = false;
+            self.auto_leave_at = None;
+        }
+
+        // —— 高度：向 展开=BAR_HEIGHT / 收线=AUTO_STRIP_H 缓动 ——
+        let target_h = if self.auto_open { BAR_HEIGHT } else { AUTO_STRIP_H };
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        if dt > 0.0 {
+            let k = 1.0 - (-AUTO_K * dt).exp();
+            self.auto_h += (target_h - self.auto_h) * k;
+            if (target_h - self.auto_h).abs() < 0.3 {
+                self.auto_h = target_h;
+            }
+        }
+
+        // —— 进度条长度动画：目标 = 最新 5s 值 ÷ 窗内动态最大值（仅线态才跟；展开态退回 0）——
+        let meter_on = self.auto_h <= STRIP_WAVE_MAX;
+        let meter_target = if meter_on {
+            data.spark.map_or(0.0, |g| meter_frac(&g))
+        } else {
+            0.0
+        };
+        let meter_moving = (self.meter - meter_target).abs() > 0.004;
+        if dt > 0.0 {
+            let k = 1.0 - (-METER_K * dt).exp();
+            self.meter += (meter_target - self.meter) * k;
+            if (meter_target - self.meter).abs() < 0.004 {
+                self.meter = meter_target;
+            }
+        }
+
+        // —— 画卡片：全高圆角底 + 描边；999 待打卡时描边红色呼吸脉冲 ——
+        // 圆角随高度收敛：还不到整卡一半高(40)时算"细线"，用 4 的小圆角，避免 CARD_RADIUS(14)
+        // 在矮条上超过半高、把上下边整个顶成胶囊形；接近整卡高才用整卡圆角。
+        let win = ui.max_rect();
+        let radius = if self.auto_h < 40.0 { 4 } else { CARD_RADIUS };
+        // 底卡 = 收线原来的颜色：给下方绿色进度条当**轨道/背景**（见 paint_strip_meter）。
+        painter.rect_filled(win, radius, pal.bg);
+        let pulse = data.punch.red;
+        let border = if pulse {
+            let k = (0.5 + 0.5 * (time * 4.2).sin()) as f32; // 0..1 正弦
+            let a = (0.35 + 0.45 * k) as u8; // alpha 35%..80% 呼吸
+            Color32::from_rgba_unmultiplied(
+                pal.danger.r(),
+                pal.danger.g(),
+                pal.danger.b(),
+                (pal.danger.a() as u32 * a as u32 / 255) as u8,
+            )
+        } else {
+            pal.border
+        };
+        let stroke_w = if pulse { 2.0 } else { 1.0 };
+        painter.rect_stroke(win, radius, Stroke::new(stroke_w, border), StrokeKind::Inside);
+
+        // —— 线态：画"会呼吸、泛光的渐变能量条"。条长已在上方缓动进 self.meter
+        // （目标 = 最新 5s 值 ÷ 窗内动态最大，见 meter_frac / METER_K），m≈0 就露轨道不画 ——
+        if self.auto_h <= STRIP_WAVE_MAX && self.meter > 0.001 {
+            paint_strip_meter(&painter, &win, self.meter, time);
+        }
+
+        // —— 高度基本到满格才画主卡内容（图标/按钮这时才可点）；收线/展开过程中只画底卡 ——
+        if self.auto_h >= BAR_HEIGHT - 2.0 {
+            let band = Rect::from_min_size(win.min, vec2(win.width(), BAR_HEIGHT));
+            self.show_bar(ui, ctx, data, band);
+        }
+
+        // 若这一帧内有动作把模式切回了常规（Auto 展开态点了开抽屉页等），Auto 的贴顶/尺寸
+        // 到此为止，交给下一帧常规分支接管，避免本帧再把窗口收细、造成跳变。
+        if self.mode != PanelMode::Auto {
+            ctx.request_repaint();
+            return;
+        }
+
+        // —— 贴到顶部：x 沿用进入 Auto 时的常规位置 x（没记录则主屏居中）——
+        let mon = ctx.input(|i| i.viewport().monitor_size);
+        if let (None, Some(mon)) = (self.auto_x, mon) {
+            let cfgx = self.shared.lock().unwrap().cfg.panel_x;
+            self.auto_x = Some(if cfgx >= 0.0 {
+                cfgx
+            } else {
+                ((mon.x - BAR_W) * 0.5).max(0.0)
+            });
+        }
+        if let Some(x) = self.auto_x {
+            let cur_min = self.outer_min(ctx);
+            let drifted = cur_min.is_none_or(|m| (m.x - x).abs() > 1.5 || m.y.abs() > 1.5);
+            // 拖动进行中绝不贴顶：本窗口拖动是自己用 OuterPosition 挪的，贴顶会把刚拖离的
+            // 窗口立刻拽回 y=0。
+            if !self.dragging && (!self.pinned || drifted) {
+                // 重新贴一次顶部（x 固定、y=0）；随后 OS 已就位就不再重发。
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(x, 0.0)));
+                self.pinned = true;
+            }
+        }
+
+        // —— 尺寸下发：宽度固定 BAR_W，高度随 auto_h ——
+        let cur = win.size();
+        let want_h = self.auto_h.round();
+        if (BAR_W - cur.x).abs() > 0.5 || (want_h - cur.y).abs() > 0.5 {
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(BAR_W, want_h)));
+        }
+
+        // —— 重绘节奏：条长还在缓动/高度动画 → 高刷跟手；收线条还活着（有样本）→ ~20fps
+        // 维持"呼吸 + 光斑漂移"的波动感；展开悬停 → 稍频；彻底静止 → 低频（进窗靠事件唤醒）——
+        let animating = (self.auto_h - target_h).abs() > 0.5;
+        let meter_alive = meter_on && self.meter > 0.001;
+        let interval = if pulse {
+            Duration::from_millis(33)
+        } else if animating || meter_moving {
+            Duration::from_millis(16)
+        } else if meter_alive {
+            Duration::from_millis(50)
+        } else if self.auto_open {
+            Duration::from_millis(120)
+        } else {
+            Duration::from_millis(250)
+        };
+        ctx.request_repaint_after(interval);
     }
 
     /// 绘制主卡内容（返回固定总宽 BAR_W）。外框恒定，内部文案在各自固定区域内自适应。
@@ -236,49 +657,30 @@ impl MxdBarApp {
             lsz[i] = measure(labels[i], &font_label); // 标签宽度恒定：只跟固定文案与字号有关
         }
 
-        // —— 按钮区：两行靠左排布、右端对齐（窄行的按钮拉宽补足，见 cells_w）。
-        // 排版基准用"每种按钮可能的最宽文案"（sizing_text）→ 每帧量出的宽度恒定，
-        // 主卡总宽由此固定，不再随 live 数字/倒计时变化；真正显示的文案另测，仅在格内居中。
+        // —— 按钮区：四个按钮共用同一个固定格宽（用户 2026-09-07：宽度按"999打卡 11h"一档统一）。
+        // 基准 = 各按钮可能最宽文案（sizing_text）的最大者，作为统一格宽的文字宽度；四格等宽、
+        // 主卡总宽因此恒定，不再随 live 数字/倒计时变化。真正显示的文案另测，仅在格内居中。
         let rows = Action::rows();
-        let lay_sizes: Vec<Vec<egui::Vec2>> = rows
+        let base_w = rows
             .iter()
-            .map(|row| row.iter().map(|a| measure(sizing_text(*a), &font_btn)).collect())
-            .collect();
+            .flatten()
+            .map(|a| measure(sizing_text(*a), &font_btn).x)
+            .fold(0.0, f32::max);
+        let cell_w = base_w + BTN_PAD_X; // 四格共用同一格宽（两侧留白合计 BTN_PAD_X）
+        let btns_w = cell_w * rows[0].len() as f32 + BTN_COL_GAP * (rows[0].len() - 1) as f32;
         // live 文案尺寸：只用于各自按钮格内居中，不影响格子宽度。
         let live_sizes: Vec<Vec<egui::Vec2>> = rows
             .iter()
             .map(|row| row.iter().map(|a| measure(button_text(*a, data), &font_btn)).collect())
             .collect();
-        // 每行各按钮宽度 = 基准文本 + 横向留白；行宽 = 行内和。
-        let row_widths: Vec<f32> = lay_sizes
-            .iter()
-            .map(|sizes| {
-                sizes.iter().map(|s| s.x).sum::<f32>()
-                    + BTN_PAD_X * sizes.len() as f32
-                    + BTN_COL_GAP * (sizes.len().saturating_sub(1)) as f32
-            })
-            .collect();
-        // 两行共用同一行宽（右端对齐）：以最宽的自然行为准；窄行的富余平均分给该行各按钮。
-        let btns_w = row_widths.iter().cloned().fold(0.0, f32::max);
-        let cells_w: Vec<Vec<f32>> = rows
-            .iter()
-            .enumerate()
-            .map(|(r, row)| {
-                let extra = (btns_w - row_widths[r]) / row.len() as f32;
-                row.iter()
-                    .enumerate()
-                    .map(|(c, _)| lay_sizes[r][c].x + BTN_PAD_X + extra)
-                    .collect()
-            })
-            .collect();
         let btns_h = 2.0 * BTN_H + BTN_ROW_GAP;
         let btns_top = (BAR_HEIGHT - btns_h) * 0.5;
 
         // —— 指标列宽：由固定总宽 BAR_W 反推（宽度恒定，不随数值位数变）。
-        // 总宽 = 2*PAD_X + METRIC_N*col_w + WAVE_W + 2*COL_GAP*(METRIC_N+1)（分隔线槽：
-        // 列间 METRIC_N-1 条 + 末列↔心电 1 条 + 心电↔按钮 1 条）+ btns_w + EXIT_GAP + EXIT_W。
+        // 总宽 = 2*PAD_X + METRIC_N*col_w + 2*COL_GAP*(METRIC_N+1)（分隔线槽）+ WAVE_W
+        //        + btns_w + RAIL_GAP + ICON_W（最右 2×2 工具格）。
         let div_slots = (METRIC_N + 1) as f32;
-        let col_w = ((BAR_W - 2.0 * PAD_X - 2.0 * COL_GAP * div_slots - WAVE_W - btns_w - EXIT_GAP - EXIT_W)
+        let col_w = ((BAR_W - 2.0 * PAD_X - 2.0 * COL_GAP * div_slots - WAVE_W - btns_w - RAIL_GAP - ICON_W)
             / METRIC_N as f32)
             .max(METRIC_MIN_W)
             .floor();
@@ -297,7 +699,7 @@ impl MxdBarApp {
         let content_h = label_h + VAL_GAP + value_h;
         let content_top = ((BAR_HEIGHT - content_h) * 0.5).max(4.0);
 
-        // —— 横向坐标：METRIC_N 个指标列（列间各一条分隔线）→ 心电区 → 按钮区 → 工具列 ——
+        // —— 横向坐标：METRIC_N 个指标列（列间各一条分隔线）→ 心电区 → 按钮区 → 工具格 ——
         let mut cols = [Rect::ZERO; METRIC_N];
         let mut divs = [0.0f32; METRIC_N + 1];
         let mut cursor = bar.left() + PAD_X;
@@ -312,7 +714,7 @@ impl MxdBarApp {
         divs[METRIC_N] = cursor; // 心电区 / 按钮区 分隔线
         cursor += COL_GAP;
         let btns_left = cursor;
-        let exit_left = btns_left + btns_w + EXIT_GAP;
+        let grid_left = btns_left + btns_w + RAIL_GAP;
         // 总宽固定（外框以 BAR_W 为准）。
         let total_w = BAR_W;
 
@@ -336,10 +738,19 @@ impl MxdBarApp {
 
         // —— 交互 ——
         // 先注册"整条拖动"（只主卡带可拖动，抽屉内容不抢）：按住空白处拖动窗口。
+        // 两种模式都能拖，进/出 Auto 完全由**松手落点**决定（见 end_drag）。OS 标题栏拖拽
+        // (StartDrag) 在此置顶/无边框/透明窗上实测拖不动，故自己用 drag_follow 每帧发
+        // OuterPosition 跟随光标。Auto 收缩细线态不画主卡带、无 drag → 天然固定不可拖动。
         let drag_id = ui.id().with("bar_drag");
         let drag = ui.interact(bar, drag_id, Sense::drag());
         if drag.drag_started() {
-            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            self.drag_start(ctx);
+        }
+        if drag.dragged() {
+            self.drag_follow(ctx);
+        }
+        if drag.drag_stopped() {
+            self.end_drag(ctx);
         }
 
         // 两行按钮（后注册的在顶层，点击优先交给按钮）。
@@ -348,7 +759,6 @@ impl MxdBarApp {
             for (c, act) in row.iter().enumerate() {
                 let text = button_text(*act, data);
                 let tsize = &live_sizes[r][c];
-                let cell_w = cells_w[r][c];
                 let cell = Rect::from_min_size(
                     pos2(cx, bar.top() + btns_top + r as f32 * (BTN_H + BTN_ROW_GAP)),
                     vec2(cell_w, BTN_H),
@@ -364,33 +774,44 @@ impl MxdBarApp {
             }
         }
 
-        // —— 最右工具列：两行小工具图标，垂直与左侧两行按钮对齐 ——
-        // 上：退出 X；下：刷新 = 清空 实时/预估经验队列。无边框底色，仅文字/图形 + 悬停反馈。
-        let exit_cx = exit_left + EXIT_W * 0.5;
-        let row1_y = bar.top() + btns_top;
-        let row2_y = row1_y + BTN_H + BTN_ROW_GAP;
-
-        let exit_rect = Rect::from_center_size(pos2(exit_cx, row1_y + BTN_H * 0.5), vec2(EXIT_W, BTN_H));
-        let exit_id = ui.id().with("mxd_exit");
-        let exit_resp = ui.interact(exit_rect, exit_id, Sense::click());
-        if exit_resp.clicked() {
-            self.on_action(ctx, Action::Exit);
+        // —— 最右 2×2 工具格：上行 日志·关闭，下行 关于·重置（用户 2026-09-07：close 与 info 互换）——
+        // 图标 PNG 先拷成局部数组（TextureId 是 Copy），免得借用 self.icons 时再可变调 self.on_action。
+        let grid: [[(Action, egui::TextureId); 2]; 2] = {
+            let icons = self.icons.as_ref().expect("工具图标已在 ui() 首帧加载");
+            [
+                [(Action::Log, icons.debug.id()), (Action::Exit, icons.close.id())],
+                [(Action::About, icons.info.id()), (Action::Refresh, icons.reload.id())],
+            ]
+        };
+        let row0_y = bar.top() + btns_top;
+        let row1_y = row0_y + BTN_H + BTN_ROW_GAP;
+        let row_centers = [row0_y + BTN_H * 0.5, row1_y + BTN_H * 0.5];
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        for (r, row) in grid.iter().enumerate() {
+            for (c, &(act, tex)) in row.iter().enumerate() {
+                let cx = grid_left + c as f32 * (ICON_C + ICON_GAP_X) + ICON_C * 0.5;
+                let cell = Rect::from_center_size(pos2(cx, row_centers[r]), vec2(ICON_C, ICON_C));
+                let resp = ui.interact(cell, ui.id().with(("mxd_tool", r, c)), Sense::click());
+                if resp.clicked() {
+                    self.on_action(ctx, act);
+                }
+                paint_icon_hover(&painter, &cell, &resp);
+                painter.image(tex, cell, uv, Color32::WHITE);
+            }
         }
-        paint_exit(&painter, &exit_rect, &exit_resp);
-
-        let ref_rect = Rect::from_center_size(pos2(exit_cx, row2_y + BTN_H * 0.5), vec2(EXIT_W, BTN_H));
-        let ref_id = ui.id().with("mxd_refresh");
-        let ref_resp = ui.interact(ref_rect, ref_id, Sense::click());
-        if ref_resp.clicked() {
-            self.on_action(ctx, Action::Refresh);
-        }
-        paint_refresh(&painter, &ref_rect, &ref_resp);
 
         total_w
     }
 
     /// 按钮点击入口。
     fn on_action(&mut self, ctx: &egui::Context, action: Action) {
+        // Auto（悬停展开）态下，除 关闭/重置/管理（只管开外链，无需常规窗口）外，其余动作
+        // 都要先退回常规再执行：开抽屉页（上报/计时/日志/关于）需要一个完整的常规窗口；
+        // 这也隐含"Auto 里点这些 = 退出 Auto"。
+        let wants_normal = !matches!(action, Action::Exit | Action::Refresh | Action::Manage);
+        if self.mode == PanelMode::Auto && wants_normal {
+            self.exit_auto_restore(ctx);
+        }
         match action {
             Action::Report => {
                 let mut g = self.shared.lock().unwrap();
@@ -399,6 +820,17 @@ impl MxdBarApp {
                 } else {
                     g.init_report(); // 从 data.ini 带出默认值 + 缓存当前 预估EXP/时
                     g.page = Page::Report;
+                }
+                drop(g);
+                ctx.request_repaint();
+            }
+            Action::Log => {
+                // 控制台式 EXP 日志页：与 Report 同款 toggle（开/关抽屉）。
+                let mut g = self.shared.lock().unwrap();
+                if g.page == Page::Log {
+                    g.page = Page::None;
+                } else {
+                    g.page = Page::Log;
                 }
                 drop(g);
                 ctx.request_repaint();
@@ -419,10 +851,20 @@ impl MxdBarApp {
                 drop(g);
                 ctx.request_repaint();
             }
-            Action::Punch | Action::Merchant | Action::Boss => {
+            Action::About => {
+                // 「关于」页：版本 + 官网，与 Report/Log 同款 toggle（开/关抽屉）。
+                let mut g = self.shared.lock().unwrap();
+                if g.page == Page::About {
+                    g.page = Page::None;
+                } else {
+                    g.page = Page::About;
+                }
+                drop(g);
+                ctx.request_repaint();
+            }
+            Action::Punch | Action::Boss => {
                 let kind = match action {
                     Action::Punch => TimePickKind::Punch,
-                    Action::Merchant => TimePickKind::Merchant,
                     Action::Boss => TimePickKind::Boss,
                     _ => unreachable!(),
                 };
@@ -432,16 +874,8 @@ impl MxdBarApp {
                 if g.page == Page::TimePick(kind) {
                     g.page = Page::None; // 再点一次 = 收起
                 } else {
-                    // 默认值：Punch/BOSS=点击按钮那一刻的时分；Merchant=已有周期或 05:59。
-                    let (h, m) = match kind {
-                        TimePickKind::Punch | TimePickKind::Boss => (nt.hour(), nt.minute()),
-                        TimePickKind::Merchant => g
-                            .cfg
-                            .merchant_time
-                            .map(|t| (t.hour(), t.minute()))
-                            .unwrap_or((5, 59)),
-                    };
-                    g.pick = PickState { h, m };
+                    // 默认值 = 点击按钮那一刻的时分。
+                    g.pick = PickState { h: nt.hour(), m: nt.minute() };
                     g.page = Page::TimePick(kind);
                 }
                 drop(g);
@@ -463,16 +897,33 @@ impl MxdBarApp {
 impl eframe::App for MxdBarApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 拖动兜底：正常 egui 会在松手那帧给 drag_stopped → end_drag 已把 dragging 复位。
+        // 若光标短暂甩出窗外导致 egui 没收到松手、而主键已抬起（拖动中我们在持续重绘、能看到
+        // 按键状态），这里也结束拖动，避免窗口卡在"跟手"状态。
+        if self.dragging && !ctx.input(|i| i.pointer.primary_down()) {
+            self.end_drag(&ctx);
+        }
         if !self.fonts_installed {
             crate::theme::install_fonts(&ctx);
             crate::theme::apply_ui_style(&ctx);
             self.fonts_installed = true;
+        }
+        // 工具图标纹理需要 ctx，首帧建一次。
+        if self.icons.is_none() {
+            self.icons = Some(Icons::load(&ctx));
         }
 
         // —— 当前页 + 一帧要显示的全部值（一次快照）——
         let (page, data) = self.snapshot();
         let open = page != Page::None;
 
+        // —— Auto：贴顶收缩/悬停展开，不走下方普通分支 ——
+        if self.mode == PanelMode::Auto {
+            self.ui_auto(ui, &ctx, &data);
+            return;
+        }
+
+        // ---- Normal 常规模式 ----
         let win = ui.max_rect(); // 当前实际窗口内容区
         let painter = ui.painter().clone();
         let pal = Palette::dark();
@@ -505,6 +956,8 @@ impl eframe::App for MxdBarApp {
                         Page::None => {}
                         Page::Report => report::page(ui, &shared),
                         Page::TimePick(kind) => pickers::page(ui, &shared, kind),
+                        Page::Log => log::page(ui, &shared),
+                        Page::About => about::page(ui, &shared),
                     }
                     used_h = ui.min_rect().height();
                 },
@@ -549,15 +1002,28 @@ impl eframe::App for MxdBarApp {
             self.sized = true;
         }
 
-        // —— 首次对齐后，把窗口放到主屏顶部中央 ——
+        // —— 首帧/切回常规后：把窗口放到保存的常规位置（没记录过 → 主屏顶部居中 y=40）——
         if self.sized && !self.positioned {
             if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
-                let x = ((mon.x - want_w) * 0.5).max(0.0);
-                let y = 40.0;
+                let (cfgx, cfgy) = {
+                    let g = self.shared.lock().unwrap();
+                    (g.cfg.panel_x, g.cfg.panel_y)
+                };
+                let x = if cfgx >= 0.0 {
+                    cfgx
+                } else {
+                    ((mon.x - want_w) * 0.5).max(0.0)
+                };
+                let y = if cfgy >= 0.0 { cfgy } else { 40.0 };
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(x, y)));
                 self.positioned = true;
+                self.last_pos = Some([x, y]);
+                self.last_save_at = None;
             }
         }
+
+        // 常规位置心跳：拖动停稳后把最终落点写回 ini。
+        self.heartbeat_save_pos(&ctx);
 
         // —— 心跳：动画期间高频重绘让它"滑"出来；其余 1s 一次刷计时/速率 ——
         let animating = (self.panel_h - target_h).abs() > 0.5;
@@ -573,13 +1039,18 @@ impl eframe::App for MxdBarApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
     }
+
+    /// 退出兜底：模式/位置在切换点已各自落盘，这里再把当前 cfg 写一次收尾。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let g = self.shared.lock().unwrap();
+        let _ = crate::config::save(&g.cfg);
+    }
 }
 
-/// 按钮显示文本：三个计时按钮实时变化，其余用固定标签。
+/// 按钮显示文本：两个计时按钮实时变化，其余用固定标签。
 fn button_text(act: Action, data: &BarData) -> &str {
     match act {
         Action::Punch => &data.punch.text,
-        Action::Merchant => &data.merchant.text,
         Action::Boss => &data.boss.text,
         _ => act.label(),
     }
@@ -588,23 +1059,23 @@ fn button_text(act: Action, data: &BarData) -> &str {
 fn timer_for(act: Action, data: &BarData) -> Option<&TimerUi> {
     match act {
         Action::Punch => Some(&data.punch),
-        Action::Merchant => Some(&data.merchant),
         Action::Boss => Some(&data.boss),
         _ => None,
     }
 }
 
-/// 排版基准用文案 = 每种按钮可能出现的最宽文本。按钮格宽度按它测量 → 恒定不随 live 变；
-/// 因此这套文案必须覆盖到所有会出现的状态，少了新文案才会溢出格。
+/// 按钮排版基准文案：布局以"四个按钮中最宽的这一档"为准定**统一格宽**（四格等宽、恒定，
+/// 不随 live 变）。因此这套文案须覆盖各按钮会出现的较宽状态，缺了才可能溢出格子。
 fn sizing_text(act: Action) -> &'static str {
     match act {
         Action::Report => "上报数据",
         Action::Manage => "管理数据",
-        Action::Punch => "999打卡 无",
-        Action::Merchant => "神秘商人 已刷新",
+        // 999 的基准用"11h"这一档（用户 2026-09-07：四格宽度按它统一）——比"无"略宽，
+        // 覆盖 999 大多数倒计时形态；真正最宽文案由四者取最大兜底，不会溢出。
+        Action::Punch => "999打卡 11h",
         Action::Boss => "BOSS 无",
-        // 不在按钮行里（最右工具列），不参与排版。
-        Action::Exit | Action::Refresh => "",
+        // 不在按钮行里（最右工具格），不参与排版。
+        Action::Exit | Action::Refresh | Action::Log | Action::About => "",
     }
 }
 
@@ -700,6 +1171,105 @@ fn paint_wave(painter: &egui::Painter, rect: &Rect, gains: &[i64; SPARK_BUCKETS]
     }
 }
 
+/// 收线进度条的长度比例（0..1）= 最新一个 5s 增量 ÷ 整个 60s 窗内的**动态最大值**，
+/// 供 ui_auto 每帧当作目标去缓动（见 METER_K），避免值跳变时条长一格格地蹦。
+/// 例：5 →100%（自身即峰）→ 100 仍 100%（刷新峰）→ 20 时 20% → 30 时 30% ——
+/// 高峰只要还活在 60s 窗里就压住比例，滑出窗外（或最新值追平它）才把满格让出来。
+fn meter_frac(gains: &[i64; SPARK_BUCKETS]) -> f32 {
+    let latest = *gains.last().unwrap_or(&0);
+    let dmax = *gains.iter().max().unwrap_or(&0);
+    if dmax <= 0 {
+        return 0.0; // 无正增量 → 0，露出轨道
+    }
+    (latest as f64 / dmax as f64).clamp(0.0, 1.0) as f32
+}
+
+/// 把 0..255 的三通道（可能带小数）取整成不透明色；越界先夹回，防 u8 环绕。
+fn meter_rgb(c: [f32; 3]) -> Color32 {
+    Color32::from_rgb(
+        c[0].clamp(0.0, 255.0).round() as u8,
+        c[1].clamp(0.0, 255.0).round() as u8,
+        c[2].clamp(0.0, 255.0).round() as u8,
+    )
+}
+
+/// 收线进度条**整条**的颜色（不随条上的位置变，整条同一色）：由当前波动值的高低决定——
+/// 值越低越红、稍高转黄、接近/追平窗内巅峰才绿。输入比例 = 最新 5s 值 ÷ 窗内动态最大
+/// （就是 `frac` 本身），所以条越长颜色也越偏绿，短红条 = 这 5s 偏弱、长绿条 = 正在巅峰，
+/// 一眼可辨。
+fn meter_hue(frac: f32) -> [f32; 3] {
+    let red = [238.0, 84.0, 66.0];
+    let yellow = [252.0, 206.0, 66.0];
+    let green = [92.0, 226.0, 158.0];
+    let t = frac.clamp(0.0, 1.0);
+    let (a, b, tt) = if t < 0.5 {
+        (red, yellow, t * 2.0)
+    } else {
+        (yellow, green, (t - 0.5) * 2.0)
+    };
+    [
+        a[0] + (b[0] - a[0]) * tt,
+        a[1] + (b[1] - a[1]) * tt,
+        a[2] + (b[2] - a[2]) * tt,
+    ]
+}
+
+/// 收线(线态)专用：把**最新一个 5s 的经验增量**（已缓动到 `frac`）画成一条从左侧生长、
+/// 会"呼吸 + 泛光"的能量条。整条颜色由值的高低统一给出（见 meter_hue）：
+/// 低 = 红、中 = 黄、高 = 绿；条长 = 该值 ÷ 窗内动态最大，二者同源同步。画面要素——
+///  - 立体感：每列下缘再压暗 ~0.84 倍，截面带一点"柱/管"味。
+///  - 呼吸感：整条亮度按 sin(时间×2.6) 明灭。
+///  - 波动感：一道白色"光斑"每 ~1.4s 从条头漂向条尾（高斯软峰**叠加**在底色上，暗尾也看得清）。
+///
+/// 背景 = 收线原底色，当"轨道"（见 ui_auto 底卡绘制）。长度 0（frac≤0）→ 不画、露轨道。
+/// 例：5 →100%（自身即峰）→ 100 仍 100%（刷新峰）→ 20 时 20%（红）→ 30 时 30%（红）。
+fn paint_strip_meter(painter: &egui::Painter, rect: &Rect, frac: f32, time: f64) {
+    if frac <= 0.0 {
+        return; // 最小长度 0
+    }
+    // 轨道内缩出边距、别顶到描边/圆角；条从最左起、长度按比例向右。
+    let rail = rect.shrink2(vec2(3.0, 2.5));
+    let fill_w = (rail.width() * frac).max(1.0);
+    let top = rail.top();
+    let bottom = rail.bottom();
+
+    // 整条颜色一次算好（跟随缓动中的 frac 一起变，变色也是平滑推过去的）。
+    let base = meter_hue(frac);
+    // 呼吸亮度：整条在 ~0.6..1.0 间明灭（呼吸感）。
+    let breathe = 0.80 + 0.20 * (time * 2.6).sin() as f32;
+    // 光斑相位 0..1：0 在条头、1 在条尾，每 ~1.4s 从条头漂完一整条到条尾。
+    let phase = (time / 1.4).fract() as f32;
+
+    let n = ((fill_w / 8.0).ceil() as usize).clamp(2, 200);
+    let mut mesh = egui::epaint::Mesh::default();
+    for i in 0..n {
+        let xn = (i as f32 + 0.5) / n as f32; // 本列中心：0=条尾..1=条头（仅决定 x，不影响色）
+        let x0 = rail.left() + fill_w * i as f32 / n as f32;
+        let x1 = rail.left() + fill_w * (i + 1) as f32 / n as f32;
+
+        // 光斑以"离条头的距离"定位：r=0 头..1 尾，软峰**加法**叠白——暗尾处也看得见亮斑扫过。
+        let r = 1.0 - xn;
+        let dist = (r - phase).abs();
+        let gauss = (-(dist * dist) * 22.0).exp(); // 0..1，峰在光斑中心
+        let sheen = 85.0 * gauss;
+        let mut top_c = [0.0_f32; 3];
+        let mut bot_c = [0.0_f32; 3];
+        for ci in 0..3 {
+            let v = (base[ci] * breathe + sheen).clamp(0.0, 255.0);
+            top_c[ci] = v;
+            bot_c[ci] = v * 0.84; // 下缘压暗 → 截面"柱"感
+        }
+        let i0 = mesh.vertices.len() as u32;
+        mesh.colored_vertex(pos2(x0, top), meter_rgb(top_c));
+        mesh.colored_vertex(pos2(x0, bottom), meter_rgb(bot_c));
+        mesh.colored_vertex(pos2(x1, bottom), meter_rgb(bot_c));
+        mesh.colored_vertex(pos2(x1, top), meter_rgb(top_c));
+        mesh.add_triangle(i0, i0 + 1, i0 + 2);
+        mesh.add_triangle(i0, i0 + 2, i0 + 3);
+    }
+    painter.add(mesh);
+}
+
 /// 画一个按钮，按悬停/按下状态变色；`emph` 决定是否用橘黄重点配色。
 /// 计时按钮可叠加红/绿与抖动（文字/描边变色）。
 fn paint_button(
@@ -729,7 +1299,7 @@ fn paint_button(
     };
     let mut border = border;
     let mut text_color = text_color;
-    // 计时状态覆盖文字/边框颜色（红/绿）
+    // 计时状态覆盖文字/边框颜色（红 = 待打卡/BOSS 就绪）
     let mut jitter = false;
     if let Some(tu) = timer {
         if tu.red {
@@ -739,9 +1309,6 @@ fn paint_button(
             if resp.hovered() {
                 fill = pal.danger; // 待打卡悬停时底色也红一点，更醒目
             }
-        } else if tu.green {
-            border = pal.success;
-            text_color = pal.success;
         }
     }
 
@@ -778,60 +1345,10 @@ fn paint_button(
     );
 }
 
-/// 悬停/按下的工具图标配色（无边框、无底色）。
-fn icon_glyph(resp: &egui::Response) -> Color32 {
-    if resp.hovered() || resp.is_pointer_button_down_on() {
-        Color32::WHITE
-    } else {
-        Color32::from_rgb(205, 211, 224)
-    }
-}
-
 /// 工具图标悬停时画一点很淡的圆形反馈，让人知道它可点。
 fn paint_icon_hover(painter: &egui::Painter, rect: &Rect, resp: &egui::Response) {
     if resp.hovered() || resp.is_pointer_button_down_on() {
         let r = rect.height().min(rect.width()) * 0.5;
         painter.circle_filled(rect.center(), r, Color32::from_rgba_unmultiplied(120, 130, 150, 40));
     }
-}
-
-/// 退出 X（工具列上行）：无边框底色，白色 X，居中于行。
-fn paint_exit(painter: &egui::Painter, rect: &Rect, resp: &egui::Response) {
-    paint_icon_hover(painter, rect, resp);
-    painter.text(
-        rect.center() - vec2(0.0, 1.0),
-        Align2::CENTER_CENTER,
-        "X",
-        FontId::proportional(16.0),
-        icon_glyph(resp),
-    );
-}
-
-/// 刷新图标（工具列下行）：一段约 300° 的圆环弧 + 指向行进方向的箭头（画成圆形刷新，
-/// 不依赖字体是否有该字形）。点击 = 清空 实时/预估经验队列。
-fn paint_refresh(painter: &egui::Painter, rect: &Rect, resp: &egui::Response) {
-    use std::f32::consts::{PI, TAU};
-    paint_icon_hover(painter, rect, resp);
-    let color = icon_glyph(resp);
-    let c = rect.center() + vec2(0.0, 0.5);
-    let r = (rect.height() * 0.32).clamp(5.0, 9.0);
-    // 弧段：从右下一带顺时针扫过底部/左侧/顶部，在右上留下一小段缺口（refresh 的"断口"）。
-    let open = 1.05; // 缺口弧度 ≈60°
-    let a0 = PI * 0.25; // 弧起点（缺口一沿）
-    let a1 = a0 + (TAU - open); // 弧终点（缺口另一沿），箭头收在此处
-    let segs = 28;
-    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(segs + 1);
-    for i in 0..=segs {
-        let a = a0 + (a1 - a0) * (i as f32 / segs as f32);
-        pts.push(pos2(c.x + a.cos() * r, c.y + a.sin() * r));
-    }
-    painter.add(egui::Shape::line(pts, Stroke::new(1.6, color)));
-    // 弧末端按行进方向画一个 ">" 箭头。
-    let e = c + vec2(a1.cos() * r, a1.sin() * r);
-    let fwd = vec2(-a1.sin(), a1.cos()); // 增大角度 = 行进切线（单位）
-    let nrm = vec2(fwd.y, -fwd.x);
-    let back = 2.6;
-    let spread = 2.4;
-    painter.line_segment([e, e - fwd * back + nrm * spread], Stroke::new(1.6, color));
-    painter.line_segment([e, e - fwd * back - nrm * spread], Stroke::new(1.6, color));
 }

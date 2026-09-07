@@ -3,6 +3,7 @@
 //! UI 目前是单窗口（主卡 + 下方抽屉页），页面绘制需要 `&mut` 编辑缓冲，
 //! 全部可变状态集中在这里，用 `Arc<Mutex<Shared>>` 传递，避免跨线程（sampler）抢锁。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,23 +16,76 @@ pub enum Page {
     None,
     /// 上报数据（或其后继的成功页，看 report.phase）。
     Report,
-    /// 三个计时按钮共用的时分选择页。
+    /// 两个计时按钮（999打卡/BOSS）共用的时分选择页。
     TimePick(TimePickKind),
+    /// 控制台式 EXP 日志页。
+    Log,
+    /// 「关于」页：工具版本 + 官网。
+    About,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimePickKind {
     Punch,
-    Merchant,
     Boss,
 }
 
-/// 时分选择器（999打卡/神秘商人/BOSS）的编辑缓冲：当前选中的 小时/分钟。
+/// 时分选择器（999打卡/BOSS）的编辑缓冲：当前选中的 小时/分钟。
 /// app.rs 在打开时按类型预填默认值；点"确定"后据此写入 cfg 并落盘。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PickState {
     pub h: u32,
     pub m: u32,
+}
+
+// ---------------------------------------------------------------------------
+// EXP 日志（主卡「日志」抽屉页的数据源：sampler 写、UI 只读渲染）
+// ---------------------------------------------------------------------------
+
+/// EXP 日志保留的最大行数（超过丢最老）。
+pub(crate) const EXP_LOG_CAP: usize = 1000;
+
+/// 一条原始 EXP 日志（sampler 线程写入）。`seg=true` = 升级重置那一条「段头」。
+#[derive(Debug, Clone)]
+pub struct ExpLogLine {
+    /// 记录时刻的墙钟 "%H:%M:%S"。
+    pub hms: String,
+    /// 当时的全量 EXP。
+    pub exp: i64,
+    /// true = 升级段头：此行走「无 [..] 括号」，其后各行的 +Δ 相对它（也就是相对上一条）累积。
+    pub seg: bool,
+}
+
+/// 渲染用的一行（脱离 egui 可测）。`delta=None` = 段头 / 刷新后首条 / 无前一条（不显示 [ +Δ ]）。
+#[derive(Debug, Clone)]
+pub struct ExpLogRow {
+    /// 墙钟 "%H:%M:%S"。
+    pub t: String,
+    /// 当时的全量 EXP。
+    pub exp: i64,
+    /// 比上一条记录的增量。`None` 表示本行不带 [ +Δ ]。
+    pub delta: Option<i64>,
+    /// 是否为升级段头（页面在其上方画一条细分隔线开新段）。
+    pub seg: bool,
+}
+
+/// 把日志缓冲按「比上一条」换算成控制台行。规则：
+/// - 升级段头行（`seg`）→ 新起一段，`delta=None`（EXP 大跌那一条不显示 [ -负数 ]）；
+/// - 其余行 → `delta = 本行 EXP − 上一条 EXP`（段内单调，理论 ≥0）；
+/// - 没有上一条（刷新清空后首条 / cap 剪掉段头）→ 当作新起点，`delta=None`。
+pub fn exp_log_rows(log: &VecDeque<ExpLogLine>) -> Vec<ExpLogRow> {
+    let mut out = Vec::with_capacity(log.len());
+    let mut last: Option<i64> = None;
+    for ln in log {
+        let delta = match (ln.seg, last) {
+            (true, _) => None,                       // 升级段头：无括号
+            (false, Some(prev)) => Some(ln.exp.saturating_sub(prev)),
+            (false, None) => None,                   // 刷新后首条 / 被 cap 剪掉上一条
+        };
+        out.push(ExpLogRow { t: ln.hms.clone(), exp: ln.exp, delta, seg: ln.seg });
+        last = Some(ln.exp);
+    }
+    out
 }
 
 /// 主卡"心电图"的采样点数：近 1 分钟按 5s 分桶 = 12 点。
@@ -162,6 +216,8 @@ pub struct Shared {
     /// 置位后 sampler 会清掉已积累的 (时间戳,EXP) 样本链、升级观望缓冲与连续失败计数，
     /// 并把读数置回 `-`（ExpMetrics 清零）；经验速率随后从新样本重新累积。
     pub clear_queue: bool,
+    /// 控制台式 EXP 日志（每一条 记入样本/升级 都镜像一条；点刷新清空）。sampler 线程追加。
+    pub exp_log: VecDeque<ExpLogLine>,
     // —— UI 导航 ——
     pub page: Page,
     pub report: ReportState,
@@ -190,6 +246,7 @@ impl Shared {
             exp: ExpMetrics::default(),
             sampler: SamplerStatus::default(),
             clear_queue: false,
+            exp_log: VecDeque::new(),
             page: Page::None,
             report: ReportState::default(),
             pick: PickState::default(),
@@ -255,5 +312,55 @@ impl Shared {
             .and_then(|g| g.jobs.get(ji))
             .cloned()
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ln(hms: &str, exp: i64, seg: bool) -> ExpLogLine {
+        ExpLogLine { hms: hms.into(), exp, seg }
+    }
+
+    #[test]
+    fn rows_delta_vs_previous_record() {
+        let mut log = VecDeque::new();
+        log.push_back(ln("11:14:22", 232_999, false));
+        log.push_back(ln("11:14:27", 233_222, false));
+        log.push_back(ln("11:14:32", 233_445, false));
+        let rows = exp_log_rows(&log);
+        // 首条没有前一条 → 无括号；其后 = 比上一条的增量（用户示例 [+223]）。
+        assert_eq!(rows[0].delta, None);
+        assert_eq!(rows[1].delta, Some(223));
+        assert_eq!(rows[2].delta, Some(223));
+        assert_eq!(rows[1].t, "11:14:27");
+        assert_eq!(rows[1].exp, 233_222);
+    }
+
+    #[test]
+    fn levelup_seg_head_has_no_negative_bracket() {
+        // 刷满后升级：EXP 一次大跌成新等级低值，那一条是段头（无括号）；其后 +Δ 正常为正。
+        let mut log = VecDeque::new();
+        log.push_back(ln("11:20:00", 500_000, false));
+        log.push_back(ln("11:20:05", 500_200, false));
+        log.push_back(ln("11:20:10", 3_120, true)); // 升级段头
+        log.push_back(ln("11:20:15", 3_350, false));
+        log.push_back(ln("11:20:20", 3_580, false));
+        let rows = exp_log_rows(&log);
+        assert_eq!(rows[2].delta, None, "升级大跌行不得显示 [ -负数 ]");
+        assert_eq!(rows[3].delta, Some(230), "段头后第一行相对段头(上一条)为正");
+        assert_eq!(rows[4].delta, Some(230));
+    }
+
+    #[test]
+    fn trimmed_head_is_new_baseline() {
+        // cap 剪掉段头后，保留下来的第一行退化为"新起点"（无括号），后续仍比上一条。
+        let mut log = VecDeque::new();
+        log.push_back(ln("11:20:10", 3_120, true)); // 这段原本会被剪掉
+        log.push_back(ln("11:20:15", 3_350, false));
+        let rows = exp_log_rows(&log);
+        assert_eq!(rows[0].delta, None);
+        assert_eq!(rows[1].delta, Some(3_350 - 3_120));
     }
 }

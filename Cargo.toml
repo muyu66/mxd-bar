@@ -1,11 +1,15 @@
 [package]
 name = "mxd-bar"
-version = "2.0.0"
+version = "2.3.0"
 edition = "2024"
 
 [dependencies]
 # 只启用 glow 渲染 + 内置字体，去掉默认的 wgpu/accesskit 等，减小体积与内存。
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+
+# 主卡右上角 2×2 工具图标的 PNG → egui 纹理（随 exe include_bytes! 内嵌，见 icons.rs）。
+# 只开 png 解码，去掉默认的其它图像格式/并行解码，控制体积。
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # 数据表 JSON 解析
 serde = { version = "1", features = ["derive"] }

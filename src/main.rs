@@ -9,6 +9,7 @@
 mod app;
 mod config;
 mod data;
+mod icons;
 mod net;
 mod sensor;
 mod state;

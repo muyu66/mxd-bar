@@ -1,18 +1,33 @@
 //! data.ini 持久化：读写 `%APPDATA%\mxd-bar\data.ini`。
 //!
-//! 存放：上报表单默认值([report])、三个计时器目标([timers])、
+//! 存放：上报表单默认值([report])、两个计时器目标([timers])、
 //! OCR 校准标签([ocr])、用户 ID 缓存([meta])。
 //! 自实现一个小 INI（无第三方依赖）：行式解析，支持 `[section]` 与 `key=value`，
 //! 整行注释以 `;` 或 `#` 开头。
+//!
+//! `[panel]` 只存主卡**上次退出时的位置**(x/y)，不存布局模式 —— 是否"顶部吸附/收缩展开"
+//! 完全由该位置反推(app.rs：y 落进顶部吸附带 ≤TOP_SNAP → 启动即 Auto 收起；否则常规)。
+//! 旧 ini 里遗留的 `mode=` 键读盘时会被忽略，不影响 x/y。
 
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{NaiveDate, NaiveTime};
+
+/// 主卡两种布局模式。**只作运行时内存态、不落盘** —— ini 里不存 mode，
+/// 启动时由 `[panel] y`(上次退出位置)是否落在顶部吸附带内反推(见 app.rs `new`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelMode {
+    /// 常规模式：悬浮可任意拖动、位置自由。把卡片拖到屏幕顶部松手即切到 Auto。
+    Normal,
+    /// 收缩/展开模式：固定贴屏幕顶部(y=0)，平时收成一条线，悬停展开、离开 5s 收回；
+    /// 悬停展开态拖离顶部松手会切回 Normal。
+    Auto,
+}
 
 /// 整套可持久化配置（内存镜像）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     // —— [report] ——
     pub level: u32,
@@ -28,11 +43,6 @@ pub struct AppConfig {
     // —— [timers] ——
     /// 999打卡：某天的时分（含日期，用于判断"已过点"）。
     pub punch: Option<(NaiveDate, NaiveTime)>,
-    /// 神秘商人：循环周期时长（时分，如 05:59 = 每 5h59m 刷新一轮）；缺省=None → 按钮显示"无"。
-    pub merchant_time: Option<NaiveTime>,
-    /// 神秘商人循环的"锚点"：用户最近一次点确定（设定周期）的时刻（含秒）。
-    /// 倒计时从该锚点起每满一个周期归零一次并重新从周期值倒数。
-    pub merchant_ref: Option<NaiveDateTime>,
     /// BOSS：设定时刻（日期+时分），用于秒表计时。
     pub boss: Option<(NaiveDate, NaiveTime)>,
 
@@ -48,6 +58,35 @@ pub struct AppConfig {
     /// true = 用本地测试地址(http://127.0.0.1:3001)；false = 生产 https://mxd.zhuzhu.website。
     /// 对应 ini 的 `[net] base=local|prod`（缺省 prod）。改了无需重新编译，方便联调后切回生产。
     pub net_local: bool,
+
+    // —— [panel] ——
+    /// 主卡**上次退出时的左上角 x**（逻辑像素）。<0 = 还没记录过 → 启动顶部居中。
+    pub panel_x: f32,
+    /// 主卡**上次退出时的左上角 y**（逻辑像素）。<0 = 还没记录过 → 启动 y=40。
+    /// 是否进入顶部收缩/展开(Auto)由它反推：y 落在顶部吸附带(≤ app::TOP_SNAP)内 →
+    /// 启动即 Auto 收起贴顶；带外 → 常规悬浮不吸附。
+    pub panel_y: f32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        // 与 derive 一致，仅 `[panel]` 的 x/y 给上"未记录"哨兵（-1）。
+        AppConfig {
+            level: 0,
+            job: String::new(),
+            map: String::new(),
+            mode_solo: false,
+            power: 0,
+            punch: None,
+            boss: None,
+            exp_label: String::new(),
+            level_label: String::new(),
+            uid_cache: None,
+            net_local: false,
+            panel_x: -1.0,
+            panel_y: -1.0,
+        }
+    }
 }
 
 impl AppConfig {
@@ -129,18 +168,11 @@ fn parse_date(s: &str) -> Option<NaiveDate> {
 fn parse_time(s: &str) -> Option<NaiveTime> {
     NaiveTime::parse_from_str(s, "%H:%M").ok()
 }
-/// 锚点带秒存储（"%Y-%m-%d %H:%M:%S"），保证倒计时从确定那一刻精确起算。
-fn parse_dt(s: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
-}
 fn fmt_date(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
 }
 fn fmt_time(t: NaiveTime) -> String {
     t.format("%H:%M").to_string()
-}
-fn fmt_dt(d: NaiveDateTime) -> String {
-    d.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 impl AppConfig {
@@ -160,8 +192,6 @@ impl AppConfig {
         if let (Some(d), Some(t)) = (p_date, p_time) {
             cfg.punch = Some((d, t));
         }
-        cfg.merchant_time = get(ini, "timers", "merchant_time").and_then(parse_time);
-        cfg.merchant_ref = get(ini, "timers", "merchant_ref").and_then(parse_dt);
         let b_date = get(ini, "timers", "boss_date").and_then(parse_date);
         let b_time = get(ini, "timers", "boss_time").and_then(parse_time);
         if let (Some(d), Some(t)) = (b_date, b_time) {
@@ -172,6 +202,9 @@ impl AppConfig {
         cfg.level_label = get(ini, "ocr", "level_label").unwrap_or("Lv").to_owned();
         cfg.uid_cache = get(ini, "meta", "uid").map(str::to_owned);
         cfg.net_local = get(ini, "net", "base").is_some_and(|s| s.eq_ignore_ascii_case("local"));
+        // 只读 x/y。旧 ini 的 `[panel] mode=` 键被忽略——模式不再落盘，由 y 反推。
+        cfg.panel_x = get(ini, "panel", "x").and_then(|s| s.parse().ok()).unwrap_or(-1.0);
+        cfg.panel_y = get(ini, "panel", "y").and_then(|s| s.parse().ok()).unwrap_or(-1.0);
         cfg
     }
 
@@ -196,14 +229,6 @@ impl AppConfig {
                 out.push_str("punch_time=\n");
             }
         }
-        match self.merchant_time {
-            Some(t) => out.push_str(&format!("merchant_time={}\n", fmt_time(t))),
-            None => out.push_str("merchant_time=\n"),
-        }
-        match self.merchant_ref {
-            Some(r) => out.push_str(&format!("merchant_ref={}\n", fmt_dt(r))),
-            None => out.push_str("merchant_ref=\n"),
-        }
         match self.boss {
             Some((d, t)) => {
                 out.push_str(&format!("boss_date={}\n", fmt_date(d)));
@@ -226,6 +251,10 @@ impl AppConfig {
 
         out.push_str("[net]\n");
         out.push_str(&format!("base={}\n", if self.net_local { "local" } else { "prod" }));
+
+        out.push_str("[panel]\n");
+        out.push_str(&format!("x={}\n", self.panel_x));
+        out.push_str(&format!("y={}\n", self.panel_y));
         out
     }
 }
@@ -262,12 +291,13 @@ mod tests {
         c.mode_solo = false;
         c.power = 4832;
         c.punch = Some((parse_date("2026-09-03").unwrap(), parse_time("21:30").unwrap()));
-        c.merchant_time = parse_time("05:59");
-        c.merchant_ref = parse_dt("2026-09-03 05:59:00");
         c.boss = Some((parse_date("2026-09-03").unwrap(), parse_time("14:02").unwrap()));
         c.exp_label = "EXP".into();
         c.level_label = "Lv".into();
         c.uid_cache = Some("abcd1234".repeat(8));
+        c.net_local = true;
+        c.panel_x = 240.5;
+        c.panel_y = 40.0;
         c
     }
 
@@ -283,11 +313,40 @@ mod tests {
         assert_eq!(c.mode_solo, back.mode_solo);
         assert_eq!(c.power, back.power);
         assert_eq!(c.punch, back.punch);
-        assert_eq!(c.merchant_time, back.merchant_time);
-        assert_eq!(c.merchant_ref, back.merchant_ref);
         assert_eq!(c.boss, back.boss);
         assert_eq!(c.uid_cache, back.uid_cache);
         assert_eq!(c.net_local, back.net_local);
+        assert_eq!(c.panel_x, back.panel_x);
+        assert_eq!(c.panel_y, back.panel_y);
+    }
+
+    #[test]
+    fn panel_pos_roundtrip_and_defaults() {
+        // 默认：位置未记录(-1)；没有 panel_mode 概念
+        let d = AppConfig::default();
+        assert_eq!(d.panel_x, -1.0);
+        assert_eq!(d.panel_y, -1.0);
+        // 没写 [panel] → 未记录
+        let ini = parse_ini("[net]\nbase=local\n");
+        let c = AppConfig::from_ini(&ini);
+        assert_eq!(c.panel_x, -1.0);
+        assert_eq!(c.panel_y, -1.0);
+        // x/y 往返一致
+        let mut m = AppConfig::default();
+        m.panel_x = 300.0;
+        m.panel_y = -1.0; // 只存了 x 未存 y → y 保持未记录
+        assert_eq!(AppConfig::from_ini(&parse_ini(&m.render())).panel_x, 300.0);
+        assert_eq!(AppConfig::from_ini(&parse_ini(&m.render())).panel_y, -1.0);
+        // 乱写 → 回退未记录
+        let bad = parse_ini("[panel]\nx=abc\ny=\n");
+        let c = AppConfig::from_ini(&bad);
+        assert_eq!(c.panel_x, -1.0);
+        assert_eq!(c.panel_y, -1.0);
+        // 旧 ini 遗留的 mode 键被忽略，位置仍能正常读入
+        let old = parse_ini("[panel]\nmode=auto\nx=240.0\ny=0.0\n");
+        let c = AppConfig::from_ini(&old);
+        assert_eq!(c.panel_x, 240.0);
+        assert_eq!(c.panel_y, 0.0);
     }
 
     #[test]
@@ -313,7 +372,6 @@ mod tests {
         assert_eq!(c.job, "");
         assert!(c.mode_solo, "缺省应为单人");
         assert_eq!(c.punch, None);
-        assert_eq!(c.merchant_time, None);
         assert_eq!(c.uid_cache, None);
     }
 

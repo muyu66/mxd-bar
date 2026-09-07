@@ -1178,11 +1178,12 @@ dependencies = [
 
 [[package]]
 name = "mxd-bar"
-version = "2.0.0"
+version = "2.3.0"
 dependencies = [
  "chrono",
  "eframe",
  "embed-resource",
+ "image",
  "md-5",
  "serde",
  "serde_json",

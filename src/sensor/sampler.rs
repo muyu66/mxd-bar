@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::state::{ExpMetrics, SamplerState, Shared, SPARK_BUCKETS};
+use crate::state::{
+    ExpLogLine, ExpMetrics, SamplerState, Shared, SPARK_BUCKETS, EXP_LOG_CAP,
+};
 
 use super::capture::{
     capture_window, find_game_hwnd, frame_is_blank, is_game_foreground, window_geo,
@@ -172,6 +174,7 @@ fn drain_clear(
     }
     g.clear_queue = false;
     g.exp = ExpMetrics::default();
+    g.exp_log.clear(); // 点刷新 = 清空 EXP 日志（"刷新清空"，见 UI 决策）
     drop(g); // 本地缓冲只有本线程会碰，放锁后再清，减少持锁时间
     recs.clear();
     pending.clear();
@@ -255,6 +258,18 @@ fn tick(
     let (per_min, per_hour, n_min, n_hour) = metrics(recs, now);
 
     let mut g = shared.lock().unwrap();
+    // 控制台 EXP 日志：记入样本或升级都镜像一行（墙钟时间，不是"活动时钟"——
+    // 暂停期不采样自然不写；刷新清空交给 drain_clear）。
+    if matches!(accept, Accept::Recorded | Accept::LevelUp) {
+        g.exp_log.push_back(ExpLogLine {
+            hms: chrono::Local::now().format("%H:%M:%S").to_string(),
+            exp: exp_now,
+            seg: accept == Accept::LevelUp,
+        });
+        while g.exp_log.len() > EXP_LOG_CAP {
+            g.exp_log.pop_front();
+        }
+    }
     g.exp = ExpMetrics {
         per_min,
         per_hour,
