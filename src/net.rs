@@ -1,8 +1,9 @@
 //! 联网/系统集成：本机 UID、v2 上报接口（token + report）、浏览器打开。
 //!
-//! 对接 exp-api.md 的 **v2** 协议，只用了两个接口（PATCH 编辑能力不做）：
+//! 对接 exp-api.md 的 **v2** 协议，用了三个接口（PATCH 编辑能力不做）：
 //! - `POST /api/v2/exp/token`：用固定设备密钥换 2h 的 JWT（`X-Exp-Device-Secret: zhuzhu`）；
-//! - `POST /api/v2/exp/report`：带 `Authorization: Bearer <token>` 上报一帧快照。
+//! - `POST /api/v2/exp/report`：带 `Authorization: Bearer <token>` 上报一帧快照；
+//! - `POST /api/v2/exp/pk`：带同一 token 上报预估 EXP/h 换"实时效率 PK"名次（见 pk-api.md）。
 //!
 //! 服务地址二选一（见 `api_base`）：生产 `https://mxd.zhuzhu.website`，本地联调
 //! `http://127.0.0.1:3001`，由 data.ini `[net] base=local` 切到本地、缺省走生产。
@@ -44,6 +45,8 @@ const DEVICE_SECRET: &str = "zhuzhu";
 
 const TOKEN_PATH: &str = "/api/v2/exp/token";
 const REPORT_PATH: &str = "/api/v2/exp/report";
+/// 实时效率 PK：每 10s 上报预估 EXP/h，服务端返回名次（见 pk-api.md）。
+const PK_PATH: &str = "/api/v2/exp/pk";
 /// token 距过期不足此秒数即视为"快过期"，提前重换。
 const TOKEN_MARGIN: Duration = Duration::from_secs(600);
 
@@ -348,6 +351,46 @@ pub fn post_report(base: &str, token: &str, payload: &serde_json::Value) -> Resu
         413 => "请求体过大".to_string(),
         429 => "上报过于频繁（同一设备两次成功上报需间隔≥5秒），请稍后再试".to_string(),
         _ => format!("上报失败（HTTP {status}）：{err}"),
+    };
+    Err(ApiError { status: Some(status), message })
+}
+
+/// `POST /api/v2/exp/pk` 的成功结果：服务端算出的名次（1 起）与参与总数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PkRank {
+    /// 名次，1 = 全场第一。服务端最多留 999 个对象，理论上 ≤999；
+    /// 若服务端放宽/返回更大值，UI 显示时按 999 封顶（见 util::pk_rank_text）。
+    pub rank: u32,
+    /// 本次参与（数组内）总数；服务端没给时按 0，仅留作诊断。
+    pub total: u32,
+}
+
+/// `POST /api/v2/exp/pk`：带 token 上报"当前预估 EXP/h"，换实时名次。
+/// 请求体由调用方构造（见 pk.rs：`{ board_id, ts, exp_per_hour }`），鉴权与 v2 report 相同。
+pub fn post_pk(base: &str, token: &str, payload: &serde_json::Value) -> Result<PkRank, ApiError> {
+    let auth = format!("Bearer {token}");
+    let headers = [("Content-Type", "application/json"), ("Authorization", &auth)];
+    let (status, text) = http_post_json(base, PK_PATH, &headers, &payload.to_string())
+        .map_err(|e| ApiError { status: None, message: e })?;
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    if status == 200 {
+        return v["rank"]
+            .as_u64()
+            .map(|r| PkRank {
+                rank: r as u32,
+                total: v["total"].as_u64().unwrap_or(0) as u32,
+            })
+            .ok_or_else(|| ApiError {
+                status: Some(status),
+                message: "PK 成功但响应缺少 rank 字段".into(),
+            });
+    }
+    let err = v["error"].as_str().unwrap_or("服务器未返回具体原因");
+    let message = match status {
+        401 => "令牌无效或已过期".to_string(),
+        400 => format!("数据校验未通过：{err}"),
+        429 => "上报过于频繁（同一设备两次成功上报需间隔≥5秒），请稍后再试".to_string(),
+        _ => format!("PK 上报失败（HTTP {status}）：{err}"),
     };
     Err(ApiError { status: Some(status), message })
 }

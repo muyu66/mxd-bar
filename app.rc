@@ -14,12 +14,12 @@
     {
       VALUE "CompanyName", "zhuzhu"
       VALUE "FileDescription", "mxd-bar"
-      VALUE "FileVersion", "2.3.0"
+      VALUE "FileVersion", "2.4.0"
       VALUE "InternalName", "mxd-bar"
       VALUE "LegalCopyright", ""
       VALUE "OriginalFilename", "mxd-bar.exe"
       VALUE "ProductName", "mxd-bar"
-      VALUE "ProductVersion", "2.3.0"
+      VALUE "ProductVersion", "2.4.0"
     }
   }
   BLOCK "VarFileInfo"

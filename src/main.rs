@@ -11,6 +11,7 @@ mod config;
 mod data;
 mod icons;
 mod net;
+mod pk;
 mod sensor;
 mod state;
 mod theme;
@@ -112,6 +113,15 @@ fn main() -> eframe::Result {
                             ),
                             Err(e) => eprintln!("[nettest] report 失败: {e:?}"),
                         }
+                        // 顺带自测 PK 接口（服务端须已实现 POST /api/v2/exp/pk，见 pk-api.md）。
+                        let pk_body = serde_json::json!({
+                            "board_id": uid, "ts": chrono::Utc::now().timestamp(),
+                            "exp_per_hour": 12345,
+                        });
+                        match crate::net::post_pk(base, &tok, &pk_body) {
+                            Ok(r) => eprintln!("[nettest] pk OK rank={} total={}", r.rank, r.total),
+                            Err(e) => eprintln!("[nettest] pk 失败: {e:?}"),
+                        }
                     }
                     Err(e) => eprintln!("[nettest] token 失败: {e}"),
                 }
@@ -179,6 +189,9 @@ fn main() -> eframe::Result {
 
     // —— v2 token 预取与刷新：后台线程维护 JWT（等 uid 算好后再换），UI 不碰联网 ——
     crate::net::spawn_token_keeper(Arc::clone(&shared));
+
+    // —— 实时效率 PK：后台线程每 10s（仅当有新鲜预估EXP/时）上报换名次，写回 Shared.pk ——
+    crate::pk::spawn(Arc::clone(&shared));
 
     let result = eframe::run_native(
         "mxd-bar",

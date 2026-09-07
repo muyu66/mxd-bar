@@ -20,6 +20,16 @@ pub fn thousands(n: i64) -> String {
     out
 }
 
+/// 实时效率 PK 主卡文案：无名次 `-`；名次 >999 因服务端只保留最大 999 个对象（pk-api.md），
+/// 一律显示 `第999+名`（用户 2026-09-07：服务器可能返回更大的名次）。
+pub fn pk_rank_text(rank: Option<u32>) -> String {
+    match rank {
+        None => "-".to_owned(),
+        Some(r) if r > 999 => "第999+名".to_owned(),
+        Some(r) => format!("第{r}名"),
+    }
+}
+
 /// 秒数 → 简写（向下取整）：`33s` / `55m` / `12h`。要求 secs≥0。
 pub fn humanize_down(secs: i64) -> String {
     let secs = secs.max(0);
@@ -118,6 +128,17 @@ mod tests {
         assert_eq!(thousands(33622), "33,622");
         assert_eq!(thousands(-1234), "-1,234");
         assert_eq!(thousands(516103), "516,103");
+    }
+
+    #[test]
+    fn pk_rank_text_caps_above_999() {
+        assert_eq!(pk_rank_text(None), "-");
+        assert_eq!(pk_rank_text(Some(1)), "第1名");
+        assert_eq!(pk_rank_text(Some(57)), "第57名");
+        assert_eq!(pk_rank_text(Some(999)), "第999名");
+        // 服务器返回超过 999 → 显示"第999+名"
+        assert_eq!(pk_rank_text(Some(1000)), "第999+名");
+        assert_eq!(pk_rank_text(Some(12345)), "第999+名");
     }
 
     #[test]

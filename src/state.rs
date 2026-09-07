@@ -135,6 +135,25 @@ pub struct SamplerStatus {
     pub msg: String,
 }
 
+// ---------------------------------------------------------------------------
+// 实时效率 PK（主卡最左新区域；后台上报线程写、UI 只读渲染）
+// ---------------------------------------------------------------------------
+
+/// PK 上报线程写给 UI 看的最新状态。UI 只取 `rank` 画名次标签：
+/// `None` → 主卡显示 `-`；`Some(r)` → 显示 `第{r}名`（r>999 显示 `第999+名`）。
+#[derive(Debug, Clone, Default)]
+pub struct PkState {
+    /// 服务端返回的名次（1 起，原样未截断）。None = 还没上报成功 / 已离线被清 →
+    /// 显示 `-`。UI 显示时的 999 封顶另算（见 util::pk_rank_text），这里存原始值。
+    pub rank: Option<u32>,
+    /// 服务端返回的参与总数（可选字段；当前暂无展示位，留作诊断）。
+    pub total: Option<u32>,
+    /// 最近一次上报成功时刻（Instant::now()）；UI 可据此判断名次新鲜度（暂无展示）。
+    pub updated: Option<Instant>,
+    /// 最近一次上报失败的原因（暂无展示位，留作调试/日志）。
+    pub error: Option<String>,
+}
+
 /// 上报流程的子页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportPhase {
@@ -232,6 +251,8 @@ pub struct Shared {
     pub token_exp: Option<Instant>,
     /// 最近一次换 token 失败的原因（供 UI/调试提示，暂无展示位）。
     pub token_error: Option<String>,
+    // —— PK 后台上报线程写 ——
+    pub pk: PkState,
     // —— 只读数据表 ——
     pub jobs: Arc<Vec<JobGroup>>,
     /// 只含 `scene=="hunting"` 的地图。
@@ -255,6 +276,7 @@ impl Shared {
             token: None,
             token_exp: None,
             token_error: None,
+            pk: PkState::default(),
             jobs: Arc::new(jobs),
             maps: Arc::new(maps),
             cfg,

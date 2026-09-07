@@ -6,7 +6,7 @@
 //! 内部的数字/倒计时等 live 文案在各自固定区域内自适应（居中，必要时缩小字号），
 //! 因此外框宽度不会随内容长短抖动。
 //!
-//! 布局：主卡从左到右 —— ①实时EXP/分 ②预估EXP/时 ③测试时间 ④累计经验 ⑤心电区 ⑥按钮区 ⑦工具格
+//! 布局：主卡从左到右 —— ①实时效率PK ②实时EXP/分 ③预估EXP/时 ④测试时间 ⑤累计经验 ⑥心电区 ⑦按钮区 ⑧工具格
 //! 心电区画近 1 分钟"每 5s 净增 EXP"相对该分钟均值的波动折线（见 paint_wave）。
 //! 按钮区分两行（上报数据/管理数据 / BOSS、999打卡），其中只有「上报数据」
 //! 是橘黄重点按钮；最右是 **2×2 工具格**（PNG 图标，见 icons.rs）：上行 日志 · 关闭，
@@ -49,9 +49,9 @@ use crate::util::{fmt_clock, thousands, TimerUi};
 /// 卡片总高（逻辑像素）。
 pub const BAR_HEIGHT: f32 = 72.0;
 
-/// 主卡固定总宽（逻辑像素）。外框恒定、内部文案自适应。用户 2026-09-07 起最右工具列由单列
-/// 两枚图标改成 2×2 工具格后由 ~860 加宽到 ~872（四个指标列等宽，每列约 109px）。
-pub const BAR_W: f32 = 872.0;
+/// 主卡固定总宽（逻辑像素）。外框恒定、内部文案自适应。用户 2026-09-07：最右工具列改 2×2
+/// 工具格（→~872），同日再加最左「实时效率 PK」区（+PK_W 及其分隔槽）后到 ~974。
+pub const BAR_W: f32 = 974.0;
 /// 首次创建窗口的占位宽度（首帧后即按 BAR_W 修正）。
 pub(crate) const INITIAL_WIDTH: f32 = BAR_W;
 
@@ -79,6 +79,9 @@ const RAIL_GAP: f32 = 8.0; // 工具格与按钮区之间留的空隙
 const METRIC_MIN_W: f32 = 78.0;
 /// 指标列个数：实时EXP/分 ｜ 预估EXP/时 ｜ 测试时间 ｜ 累计经验（等宽均分剩余宽度）。
 const METRIC_N: usize = 4;
+/// 主卡最左「实时效率PK」固定区宽（用户 2026-09-07 新增：上方标题"实时效率PK"、
+/// 下方名次标签 `第x名`）。数值由后台 pk 线程每 10s 上报换回，见 state.rs PkState / pk.rs。
+const PK_W: f32 = 84.0;
 /// 心电区固定宽（用户 2026-09-04 定稿：预估列后 ~70px）。画近 1 分钟的"每 5s 经验波动"。
 const WAVE_W: f32 = 70.0;
 
@@ -170,6 +173,9 @@ pub struct BarData {
     pub test_time: String,
     /// 累计经验：当前段（自刷新/升级起）最新 EXP − 段起点 EXP。无样本显示 `-`。
     pub exp_cum: String,
+    /// 实时效率 PK 名次（服务端原样返回、未截断；显示时 >999 封顶见 util::pk_rank_text）。
+    /// None = 还没上报成功 / 已离线被清 → 显示 `-`。
+    pub pk: Option<u32>,
     /// 近 1 分钟逐 5s 净增 EXP（心电图数据源）。无样本时 None → 不画心电图。
     pub spark: Option<[i64; SPARK_BUCKETS]>,
     pub punch: TimerUi,
@@ -463,6 +469,8 @@ impl MxdBarApp {
                 } else {
                     "-".to_owned()
                 },
+                // 实时效率 PK：后台 pk 线程填的服务端原样名次；None → 主卡 `-`。
+                pk: g.pk.rank,
                 // 无样本（含启动/清空后）不画心电图。
                 spark: (g.exp.n_hour > 0).then_some(g.exp.spark),
                 punch: crate::util::punch_view(now, g.cfg.punch),
@@ -677,10 +685,12 @@ impl MxdBarApp {
         let btns_top = (BAR_HEIGHT - btns_h) * 0.5;
 
         // —— 指标列宽：由固定总宽 BAR_W 反推（宽度恒定，不随数值位数变）。
-        // 总宽 = 2*PAD_X + METRIC_N*col_w + 2*COL_GAP*(METRIC_N+1)（分隔线槽）+ WAVE_W
-        //        + btns_w + RAIL_GAP + ICON_W（最右 2×2 工具格）。
-        let div_slots = (METRIC_N + 1) as f32;
-        let col_w = ((BAR_W - 2.0 * PAD_X - 2.0 * COL_GAP * div_slots - WAVE_W - btns_w - RAIL_GAP - ICON_W)
+        // 总宽 = 2*PAD_X + PK_W（最左 PK 区）+ METRIC_N*col_w
+        //      + 2*COL_GAP*(METRIC_N+2)（PK/指标、指标列间、指标/心电 的分隔线槽）
+        //      + WAVE_W + btns_w + RAIL_GAP + ICON_W（最右 2×2 工具格）。
+        let div_slots = (METRIC_N + 2) as f32;
+        let col_w = ((BAR_W - 2.0 * PAD_X - PK_W - 2.0 * COL_GAP * div_slots
+            - WAVE_W - btns_w - RAIL_GAP - ICON_W)
             / METRIC_N as f32)
             .max(METRIC_MIN_W)
             .floor();
@@ -699,19 +709,24 @@ impl MxdBarApp {
         let content_h = label_h + VAL_GAP + value_h;
         let content_top = ((BAR_HEIGHT - content_h) * 0.5).max(4.0);
 
-        // —— 横向坐标：METRIC_N 个指标列（列间各一条分隔线）→ 心电区 → 按钮区 → 工具格 ——
+        // —— 横向坐标：PK 区 → METRIC_N 个指标列（列间各一条分隔线）→ 心电区 → 按钮区 → 工具格 ——
+        // 分隔线位置全收进 divs：0 = PK区|指标0，1..=N-1 = 指标列间，N = 末指标|心电，N+1 = 心电|按钮。
         let mut cols = [Rect::ZERO; METRIC_N];
-        let mut divs = [0.0f32; METRIC_N + 1];
+        let mut divs = [0.0f32; METRIC_N + 2];
         let mut cursor = bar.left() + PAD_X;
+        let pk_rect = Rect::from_min_size(pos2(cursor, bar.top()), vec2(PK_W, BAR_HEIGHT));
+        cursor = pk_rect.right() + COL_GAP;
+        divs[0] = cursor; // PK 区 / 指标区 分隔线
+        cursor += COL_GAP;
         for i in 0..METRIC_N {
             cols[i] = Rect::from_min_size(pos2(cursor, bar.top()), vec2(col_w, BAR_HEIGHT));
             cursor = cols[i].right() + COL_GAP;
-            divs[i] = cursor; // 分隔线（居中于自己的间隙槽）
+            divs[i + 1] = cursor; // 分隔线（居中于自己的间隙槽）
             cursor += COL_GAP;
         }
         let wave_rect = Rect::from_min_size(pos2(cursor, bar.top()), vec2(WAVE_W, BAR_HEIGHT));
         cursor = wave_rect.right() + COL_GAP;
-        divs[METRIC_N] = cursor; // 心电区 / 按钮区 分隔线
+        divs[METRIC_N + 1] = cursor; // 心电区 / 按钮区 分隔线
         cursor += COL_GAP;
         let btns_left = cursor;
         let grid_left = btns_left + btns_w + RAIL_GAP;
@@ -722,6 +737,19 @@ impl MxdBarApp {
         for i in 0..METRIC_N {
             paint_metric(&painter, &cols[i], content_top, &lsz[i], labels[i], font_label.clone(), &vsz[i], val_strs[i], vfont[i].clone(), pal.label, val_colors[i]);
         }
+
+        // —— PK 区：上方标题"实时效率PK"（与指标标签同顶、居中于本区），下方名次标签 ——
+        let pk_label = "实时效率PK";
+        let pk_cx = pk_rect.center().x;
+        let pk_lsz = measure(pk_label, &font_label);
+        painter.text(
+            pos2(pk_cx - pk_lsz.x * 0.5, content_top),
+            Align2::LEFT_TOP,
+            pk_label,
+            font_label.clone(),
+            pal.label,
+        );
+        paint_pk_value(&painter, pk_cx, content_top + label_h + VAL_GAP, data.pk, &pal, PK_W);
 
         // —— 心电区：近 1 分钟"每 5s 净增 EXP"相对该分钟均值的波动折线（无样本不画）——
         if let Some(gains) = data.spark {
@@ -1126,6 +1154,84 @@ fn paint_metric(
         font_value,
         value_color,
     );
+}
+
+/// 名次标签片的配色：第1金（主题橘）→ 第2银 → 第3铜 → 其它走中性按钮色。
+fn pk_chip_colors(rank: u32, pal: &Palette) -> (Color32, Color32, Color32) {
+    // (片底, 描边, 文字)：前三名片底用同色的极淡半透明，让档位一眼可辨又不抢底。
+    let accent = |r: u8, g: u8, b: u8| {
+        (
+            Color32::from_rgba_unmultiplied(r, g, b, 30),
+            Color32::from_rgb(r, g, b),
+            Color32::from_rgb(r, g, b),
+        )
+    };
+    match rank {
+        1 => accent(255, 152, 51), // 金 = 主题橘
+        2 => accent(203, 214, 235), // 银
+        3 => accent(222, 156, 96), // 铜
+        _ => (pal.btn_bg, pal.btn_border, pal.btn_text),
+    }
+}
+
+/// 画主卡 PK 区的名次标签（值区）：无名次 → 一枚与其它指标同尺寸的灰 `-`（空态）；
+/// 有名次 → 一枚圆角标签片，文字随名次档位上色（第1金/第2银/第3铜/其它中性），
+/// 文案超区自动缩字号。名次 >999 的显示封顶见 util::pk_rank_text。
+/// `value_top` = 指标数值区顶线（4 个指标列的数值都从这条线起排），片上垂直居中于
+/// 20px 数值行（≈value_top+13），视觉上与左右指标数值对齐。
+fn paint_pk_value(
+    painter: &egui::Painter,
+    cx: f32,
+    value_top: f32,
+    rank: Option<u32>,
+    pal: &Palette,
+    region_w: f32,
+) {
+    // 标签片可用宽：区域内左右各留 4px。
+    let max_w = region_w - 8.0;
+
+    let Some(rank) = rank else {
+        // 无名次：与其它指标一致的 20px 等宽灰 `-`（弱化，作为空态占位）。
+        let font = FontId::monospace(20.0);
+        let sz = painter
+            .layout_no_wrap("-".to_owned(), font.clone(), Color32::WHITE)
+            .size();
+        painter.text(
+            pos2(cx - sz.x * 0.5, value_top),
+            Align2::LEFT_TOP,
+            "-",
+            font,
+            Color32::from_rgba_unmultiplied(150, 165, 200, 170),
+        );
+        return;
+    };
+
+    // 字号收敛：文案超区自动缩小，宽度不受文字长短影响（与数值 fit_font 同思路）。
+    let text = crate::util::pk_rank_text(Some(rank));
+    let mut font = FontId::proportional(14.0);
+    loop {
+        let w = painter
+            .layout_no_wrap(text.clone(), font.clone(), Color32::WHITE)
+            .size()
+            .x;
+        if w <= max_w - 16.0 || font.size <= 11.0 {
+            break;
+        }
+        font.size -= 1.0;
+    }
+    let sz = painter
+        .layout_no_wrap(text.clone(), font.clone(), Color32::WHITE)
+        .size();
+    let chip_h = 22.0;
+    let pad_x = 9.0;
+    let chip_w = (sz.x + 2.0 * pad_x).max(chip_h);
+    // 垂直：片心放在 20px 数值行的中部（value_top + 13 ≈ 行中心）。
+    let chip = Rect::from_center_size(pos2(cx, value_top + 13.0), vec2(chip_w, chip_h));
+    let (fill, border, fg) = pk_chip_colors(rank, pal);
+    let radius = chip_h * 0.5;
+    painter.rect_filled(chip, radius, fill);
+    painter.rect_stroke(chip, radius, Stroke::new(1.0, border), StrokeKind::Inside);
+    painter.text(chip.center(), Align2::CENTER_CENTER, text, font, fg);
 }
 
 /// 画心电图折线：输入为近 1 分钟 12 个"每 5s 净增 EXP"。先减均值（0 落在中线），
